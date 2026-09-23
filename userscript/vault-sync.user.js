@@ -1,12 +1,15 @@
 // ==UserScript==
-// @name         Vault 一键备份助手 (原生 GitHub 风格版)
+// @name         Vault 一键备份助手 (带自检诊断版)
 // @namespace    https://github.com/owwk-backup
-// @version      1.2.0
+// @version      1.3.0
 // @description  在 GitHub 顶栏原生嵌入“备份到 Vault”按钮，秒级异步入库
 // @author       owwk-backup
 // @match        *://github.com/*
+// @match        *://*.github.com/*
+// @include      *://github.com/*
+// @include      *://*.github.com/*
 // @match        *://crates.io/*
-// @run-at       document-end
+// @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -17,7 +20,9 @@
 (function () {
     'use strict';
 
-    // 获取用户配置
+    // 🌟 诊断点 1：确认油猴是否真的成功加载运行了本脚本
+    console.log('%c[Vault Userscript] 🚀 脚本已成功唤醒！当前地址:', 'color: #1f6feb; font-weight: bold;', location.href);
+
     function getConfig() {
         return {
             workerUrl: GM_getValue('CF_WORKER_URL', 'https://your-worker-subdomain.workers.dev'),
@@ -25,7 +30,6 @@
         };
     }
 
-    // 注册右键菜单供随时修改配置
     GM_registerMenuCommand("⚙️ 配置 Cloudflare Worker 地址与密钥", () => {
         const current = getConfig();
         const url = prompt("请输入 Cloudflare Worker 完整地址：", current.workerUrl);
@@ -35,13 +39,11 @@
         alert("✅ 配置已保存！");
     });
 
-    // 官方 Octicon 归档/备份 SVG 图标
     const ARCHIVE_ICON = `
     <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" class="octicon octicon-archive mr-1" style="vertical-align: text-bottom; fill: currentColor;">
         <path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v1.5A1.75 1.75 0 0 1 13.25 6H13v6.25A2.75 2.75 0 0 1 10.25 15h-4.5A2.75 2.75 0 0 1 3 12.25V6h-.25A1.75 1.75 0 0 1 1 4.25v-1.5Zm1.75-.25a.25.25 0 0 0-.25.25v1.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-1.5a.25.25 0 0 0-.25-.25H2.75ZM4.5 6v6.25c0 .69.56 1.25 1.25 1.25h4.5c.69 0 1.25-.56 1.25-1.25V6H4.5ZM6.75 7.75a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5a.75.75 0 0 1 .75-.75Zm3.25.75a.75.75 0 0 0-1.5 0v1.5a.75.75 0 0 0 1.5 0v-1.5Z"></path>
     </svg>`;
 
-    // 触发提交任务
     function triggerBackup(btn, textSpan) {
         const config = getConfig();
         if (!config.workerUrl || config.workerUrl.includes('your-worker-subdomain')) {
@@ -96,24 +98,25 @@
         });
     }
 
-    // 注入到 GitHub 页面红圈指定位置
     function injectGitHub() {
         if (document.getElementById('vault-backup-action-item')) return;
 
-        // 多重容错查询容器：支持新旧各种布局
-        const watchAnchor = document.querySelector('#repository-details-watch-button') || 
-                            document.querySelector('#notifications-list-item') ||
-                            document.querySelector('#fork-button') ||
-                            document.querySelector('#star-button');
+        // 全维多路寻找目标按钮容器
+        const starBtn = document.querySelector('#star-button') || document.querySelector('[data-hydro-click*="star" i]');
+        const forkBtn = document.querySelector('#fork-button') || document.querySelector('[data-hydro-click*="fork" i]');
+        const watchBtn = document.querySelector('#repository-details-watch-button') || document.querySelector('#notifications-list-item');
 
-        const actionsContainer = (watchAnchor && watchAnchor.closest('ul')) ||
+        const anchor = watchBtn || forkBtn || starBtn;
+        const actionsContainer = (anchor && anchor.closest('ul')) ||
                                  document.querySelector('ul.pagehead-actions') || 
-                                 document.querySelector('#repository-details-container ul') ||
-                                 document.querySelector('[data-view-component="true"].pagehead-actions');
+                                 document.querySelector('#repository-details-container ul');
         
-        if (!actionsContainer) return;
+        if (!actionsContainer) {
+            return;
+        }
 
-        // 构造与 GitHub 100% 相同且兼容的原生 DOM 结构
+        console.log('%c[Vault Userscript] ✅ 成功定位顶栏容器，开始注入按钮！', 'color: #2da44e; font-weight: bold;');
+
         const li = document.createElement('li');
         li.id = 'vault-backup-action-item';
 
@@ -131,11 +134,9 @@
         btn.onclick = () => triggerBackup(btn, textSpan);
 
         li.appendChild(btn);
-        // 精准插入在整个按钮组最左侧
         actionsContainer.insertBefore(li, actionsContainer.firstChild);
     }
 
-    // 注入到 Crates.io 页面
     function injectCratesIo() {
         if (document.getElementById('vault-backup-action-item')) return;
         const installSection = document.querySelector('[data-test-install]');
@@ -157,28 +158,27 @@
 
     function checkAndInject() {
         const host = location.hostname;
-        if (host === 'github.com') {
-            // 确保只在仓库页面执行（过滤掉设置、动态等）
-            const parts = location.pathname.split('/').filter(Boolean);
-            if (parts.length >= 2 && !['settings', 'pulls', 'issues', 'explore', 'notifications', 'search'].includes(parts[0])) {
-                injectGitHub();
-            }
-        } else if (host === 'crates.io') {
+        if (host.includes('github.com')) {
+            injectGitHub();
+        } else if (host.includes('crates.io')) {
             injectCratesIo();
         }
     }
 
-    // 1. 初始执行
-    checkAndInject();
+    // 立即执行与多重事件监听
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', checkAndInject);
+    } else {
+        checkAndInject();
+    }
 
-    // 2. 监听 GitHub Turbo / PJAX 路由切换
     document.addEventListener('turbo:render', checkAndInject);
     document.addEventListener('turbo:load', checkAndInject);
     document.addEventListener('pjax:end', checkAndInject);
 
-    // 3. MutationObserver 监听动态 DOM 变化（彻底解决加载时序问题）
-    const observer = new MutationObserver(() => {
-        checkAndInject();
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    // 持续监听重绘
+    const observer = new MutationObserver(() => checkAndInject());
+    if (document.documentElement) {
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+    }
 })();
