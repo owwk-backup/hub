@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Vault 一键备份助手 (原生 GitHub 风格 + 高级筛选排序面板版)
 // @namespace    https://github.com/owwk-backup
-// @version      2.1.0
-// @description  左键一键备份，右键开启高级面板：多维筛选(名称/类型/权限)、智能排序、查看清单、删除项目、触发同步与 Worker 配置
+// @version      2.2.0
+// @description  原生 Starred 交互风格状态感知：左键备份/取消备份，右键开启控制台(高级筛选/排序/配置)
 // @author       owwk-backup
 // @match        *://github.com/*
 // @match        *://*.github.com/*
@@ -154,6 +154,34 @@
         pointer-events: none; opacity: 0; transition: opacity 0.2s ease;
     }
     .vault-toast.show { opacity: 1; }
+    .vault-toast-fixed {
+        position: fixed !important; bottom: 24px !important; left: 50% !important;
+        transform: translateX(-50%) !important; z-index: 10000000 !important;
+    }
+
+    /* 类似 GitHub Starred 激活态的高亮与 hover 交互效果 */
+    .vault-action-btn {
+        display: inline-flex !important; align-items: center !important;
+        cursor: pointer !important; user-select: none !important;
+        transition: all 0.2s cubic-bezier(0.3, 0, 0.5, 1) !important;
+    }
+    .vault-btn-backed {
+        background-color: rgba(56, 139, 253, 0.15) !important;
+        border-color: rgba(56, 139, 253, 0.45) !important;
+        color: #58a6ff !important;
+    }
+    .vault-btn-backed .octicon-archive {
+        color: #58a6ff !important;
+    }
+    /* 已备份按钮悬停时，呈现准备取消备份 (Unstar) 的轻微警示红调 */
+    .vault-btn-backed:hover {
+        background-color: rgba(248, 81, 73, 0.12) !important;
+        border-color: rgba(248, 81, 73, 0.45) !important;
+        color: #f85149 !important;
+    }
+    .vault-btn-backed:hover .octicon-archive {
+        color: #f85149 !important;
+    }
     @keyframes vaultFadeIn { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: scale(1); } }
     `;
 
@@ -193,6 +221,126 @@
                 ontimeout: () => reject(new Error('连接超时，请检查网络或 Worker 地址'))
             });
         });
+    }
+
+    // 解析当前页面所属的目标仓库
+    function getCurrentPageTarget() {
+        try {
+            const u = new URL(window.location.href);
+            if (u.hostname.includes('github.com')) {
+                const parts = u.pathname.split('/').filter(Boolean);
+                if (parts.length >= 2 && !['settings', 'pulls', 'issues', 'explore', 'orgs', 'notifications', 'marketplace'].includes(parts[0])) {
+                    return {
+                        type: 'git',
+                        target_repo: parts[1],
+                        fullName: `${parts[0]}/${parts[1]}`
+                    };
+                }
+            } else if (u.hostname.includes('crates.io')) {
+                const parts = u.pathname.split('/').filter(Boolean);
+                if (parts[0] === 'crates' && parts[1]) {
+                    return {
+                        type: 'crate',
+                        target_repo: parts[1],
+                        crate_name: parts[1]
+                    };
+                }
+            }
+        } catch {}
+        return null;
+    }
+
+    // 本地持久化缓存读写
+    function getCachedRepos() {
+        try {
+            const val = GM_getValue('VAULT_REPOS_CACHE', '[]');
+            return Array.isArray(val) ? val : JSON.parse(val || '[]');
+        } catch {
+            return [];
+        }
+    }
+
+    function setCachedRepos(list) {
+        try {
+            GM_setValue('VAULT_REPOS_CACHE', Array.isArray(list) ? list : []);
+        } catch (e) {
+            console.error('[Vault Cache Error]', e);
+        }
+    }
+
+    function isTargetBacked(targetName) {
+        if (!targetName) return false;
+        const list = getCachedRepos();
+        return list.some(item => (item.target_repo || item.crate_name || item) === targetName);
+    }
+
+    function addTargetToCache(targetObj) {
+        const list = getCachedRepos();
+        const name = targetObj.target_repo || targetObj.crate_name;
+        if (!list.some(item => (item.target_repo || item.crate_name || item) === name)) {
+            list.push(targetObj);
+            setCachedRepos(list);
+        }
+    }
+
+    function removeTargetFromCache(targetName) {
+        let list = getCachedRepos();
+        list = list.filter(item => (item.target_repo || item.crate_name || item) !== targetName);
+        setCachedRepos(list);
+    }
+
+    // 全局悬浮式 Toast 提示
+    function showGlobalToast(text, duration = 2500) {
+        let toast = document.getElementById('vault-global-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'vault-global-toast';
+            toast.className = 'vault-toast vault-toast-fixed';
+            document.body.appendChild(toast);
+        }
+        toast.innerText = text;
+        toast.classList.add('show');
+        setTimeout(() => toast && toast.classList.remove('show'), duration);
+    }
+
+    // 渲染备份按钮状态 (对标 GitHub 原生 Starred 视觉与交互)
+    function renderButtonState(btn, textSpan, isBacked) {
+        if (!btn || !textSpan) return;
+        if (isBacked) {
+            btn.classList.add('vault-btn-backed');
+            textSpan.innerText = '已备份';
+            btn.title = '当前仓库已在 Vault 备份清单中\n左键：取消备份并移出清单\n右键：打开管理控制台（多维筛选、排序、配置）';
+        } else {
+            btn.classList.remove('vault-btn-backed');
+            textSpan.innerText = '备份';
+            btn.title = '左键：一键备份到 Vault\n右键：打开管理控制台（多维筛选、排序、配置）';
+        }
+    }
+
+    // 刷新页面上存在的按钮状态
+    function refreshButtonStatusIfPresent() {
+        const btn = document.querySelector('#vault-backup-action-item button');
+        if (!btn) return;
+        const textSpan = btn.querySelector('.vault-btn-text');
+        const target = getCurrentPageTarget();
+        if (target && textSpan) {
+            renderButtonState(btn, textSpan, isTargetBacked(target.target_repo));
+        }
+    }
+
+    // 后台静默校验与拉取清单缓存
+    function syncReposCacheSilently() {
+        const config = getConfig();
+        if (!config.workerUrl || config.workerUrl.includes('your-worker-subdomain')) return;
+
+        callApi('/api/repos')
+            .then((res) => {
+                if (res && Array.isArray(res.data)) {
+                    setCachedRepos(res.data);
+                    refreshButtonStatusIfPresent();
+                }
+            })
+            .catch(() => {});
     }
 
     // 弹出右键控制台面板
@@ -254,6 +402,8 @@
             try {
                 const res = await callApi('/api/repos');
                 rawReposList = res.data || [];
+                setCachedRepos(rawReposList);
+                refreshButtonStatusIfPresent();
                 drawReposView();
             } catch (err) {
                 body.innerHTML = `
@@ -451,6 +601,8 @@
                     this.innerText = '移除中...';
                     try {
                         await callApi('/api/repos', 'DELETE', { target_repo: target });
+                        removeTargetFromCache(target);
+                        refreshButtonStatusIfPresent();
                         showToast(`✅ 已成功移除 ${target}`);
                         renderReposTab();
                     } catch (err) {
@@ -551,48 +703,81 @@
             .replace(/'/g, '&#039;');
     }
 
-    // 左键点击一键备份当前页面
-    function triggerQuickBackup(btn, textSpan) {
+    // 方案 A：左键点击在“备份”与“取消备份 (Unstar)”之间智能切换
+    async function handleBackupButtonClick(btn, textSpan) {
         const config = getConfig();
         if (!config.workerUrl || config.workerUrl.includes('your-worker-subdomain')) {
             openDashboardModal();
             return;
         }
 
-        btn.disabled = true;
-        btn.style.opacity = '0.7';
-        textSpan.innerText = '提交中...';
+        const target = getCurrentPageTarget();
+        if (!target) {
+            showGlobalToast('⚠️ 未能识别当前页面的仓库信息');
+            return;
+        }
 
-        callApi('/api/repos', 'POST', { url: window.location.href })
-            .then(() => {
-                textSpan.innerText = '已在队列';
-                btn.style.color = '#2da44e';
-                btn.style.borderColor = '#2da44e';
-                setTimeout(() => {
-                    btn.disabled = false;
-                    btn.style.opacity = '1';
-                    textSpan.innerText = '备份';
-                    btn.style.color = '';
-                    btn.style.borderColor = '';
-                }, 3500);
-            })
-            .catch((err) => {
-                textSpan.innerText = '提交失败';
-                btn.style.color = '#cf222e';
-                console.error('[Vault Quick Backup Error]', err);
-                setTimeout(() => {
-                    btn.disabled = false;
-                    btn.style.opacity = '1';
-                    textSpan.innerText = '备份';
-                    btn.style.color = '';
-                    btn.style.borderColor = '';
-                }, 3000);
-            });
+        const targetName = target.target_repo;
+        const backed = isTargetBacked(targetName);
+
+        if (!backed) {
+            // ===== 未备份状态：加入备份清单 =====
+            btn.disabled = true;
+            btn.style.opacity = '0.7';
+            textSpan.innerText = '提交中...';
+
+            try {
+                await callApi('/api/repos', 'POST', { url: window.location.href });
+                addTargetToCache({
+                    target_repo: targetName,
+                    type: target.type,
+                    homepage: window.location.href,
+                    private: true
+                });
+                renderButtonState(btn, textSpan, true);
+                showGlobalToast(`✅ 已将 [${targetName}] 添加至备份清单并排入同步`);
+            } catch (err) {
+                showGlobalToast(`❌ 备份失败: ${err.message}`);
+                renderButtonState(btn, textSpan, false);
+            } finally {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+            }
+        } else {
+            // ===== 已备份状态：确认取消备份 (方案 A 对标 Unstar) =====
+            if (!confirm(`确定要取消备份并从清单中移除 [${targetName}] 吗？\n(注意：不会删除实际备份仓库)`)) {
+                return;
+            }
+
+            btn.disabled = true;
+            btn.style.opacity = '0.7';
+            textSpan.innerText = '移除中...';
+
+            try {
+                await callApi('/api/repos', 'DELETE', { target_repo: targetName });
+                removeTargetFromCache(targetName);
+                renderButtonState(btn, textSpan, false);
+                showGlobalToast(`🗑️ 已从备份清单中移除 [${targetName}]`);
+            } catch (err) {
+                showGlobalToast(`❌ 移除失败: ${err.message}`);
+                renderButtonState(btn, textSpan, true);
+            } finally {
+                btn.disabled = false;
+                btn.style.opacity = '1';
+            }
+        }
     }
 
     // 核心注入函数
     function injectGitHub() {
-        if (document.getElementById('vault-backup-action-item')) return true;
+        const target = getCurrentPageTarget();
+        if (!target) return false;
+
+        const existingItem = document.getElementById('vault-backup-action-item');
+        if (existingItem) {
+            refreshButtonStatusIfPresent();
+            return true;
+        }
 
         const container = document.querySelector('[data-testid="repo-header-actions"]') ||
                           document.querySelector('[data-testid="notifications-subscriptions-menu-button"]')?.closest('ul') ||
@@ -610,13 +795,11 @@
         btn.setAttribute('data-component', 'Button');
         btn.setAttribute('data-size', 'small');
         btn.setAttribute('data-variant', 'default');
-        btn.className = 'prc-Button-ButtonBase-9n-Xk btn-sm btn';
-        btn.title = '左键：一键备份到 Vault\n右键：打开管理控制台（多维筛选、排序、配置）';
-        btn.style.cursor = 'pointer';
+        btn.className = 'prc-Button-ButtonBase-9n-Xk btn-sm btn vault-action-btn';
 
         btn.innerHTML = `
             <span data-component="buttonContent" data-align="center" class="prc-Button-ButtonContent-Iohp5">
-                <span data-component="leadingVisual" class="prc-Button-Visual-YNt2F prc-Button-LeadingVisual-UySKu prc-Button-VisualWrap-E4cnq" style="margin-right: 4px;">
+                <span data-component="leadingVisual" class="prc-Button-Visual-YNt2F prc-Button-LeadingVisual-UySKu prc-Button-VisualWrap-E4cnq vault-btn-icon" style="margin-right: 4px;">
                     ${ARCHIVE_ICON}
                 </span>
                 <span data-component="text" class="prc-Button-Label-FWkx3 vault-btn-text" style="font-weight: 600;">备份</span>
@@ -625,10 +808,13 @@
 
         const textSpan = btn.querySelector('.vault-btn-text');
 
-        // 左键：一键快速加入备份
+        // 初始依据本地缓存直接渲染状态 (零延迟)
+        renderButtonState(btn, textSpan, isTargetBacked(target.target_repo));
+
+        // 左键：智能在备份/取消备份之间切换
         btn.onclick = (e) => {
             e.preventDefault();
-            triggerQuickBackup(btn, textSpan);
+            handleBackupButtonClick(btn, textSpan);
         };
 
         // 右键：唤出高级控制台 (含筛选与排序)
@@ -640,6 +826,9 @@
 
         li.appendChild(btn);
         container.insertBefore(li, container.firstChild);
+
+        // 静默向 Worker 同步最新清单缓存
+        syncReposCacheSilently();
         return true;
     }
 
@@ -657,9 +846,19 @@
         if (checkAndInject()) clearInterval(timer);
     }, 300);
 
-    document.addEventListener('turbo:render', checkAndInject);
-    document.addEventListener('turbo:load', checkAndInject);
-    document.addEventListener('pjax:end', checkAndInject);
+    // 适配 GitHub Turbo 单页导航，换页时自动刷新状态
+    document.addEventListener('turbo:render', () => {
+        checkAndInject();
+        refreshButtonStatusIfPresent();
+    });
+    document.addEventListener('turbo:load', () => {
+        checkAndInject();
+        refreshButtonStatusIfPresent();
+    });
+    document.addEventListener('pjax:end', () => {
+        checkAndInject();
+        refreshButtonStatusIfPresent();
+    });
 
     // 注册油猴原生菜单作为兜底入口
     GM_registerMenuCommand("⚡ 打开 Vault 备份控制台", openDashboardModal);
