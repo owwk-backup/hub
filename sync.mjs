@@ -124,18 +124,33 @@ async function ensureRepo(item) {
   }
 }
 
-// 模式 1：同步 Git 仓库全量镜像
-async function syncGit(upstream, targetRepo) {
+// 模式 1：同步 Git 仓库全量镜像（防跑路防删模型）
+async function syncGit(upstream, targetRepo, item = {}) {
   const targetUrl = `https://x-access-token:${PAT}@github.com/${ORG_NAME}/${targetRepo}.git`;
-  console.log(`🔄 [Git Mirror] 正在执行镜像全量克隆与推送...`);
+  console.log(`🔄 [Git Mirror] 正在执行镜像增量克隆与安全推送 (防跑路 Append-Only 模式)...`);
   logDetail('INFO', `[Git] 开始同步 ${upstream} -> ${ORG_NAME}/${targetRepo}`);
 
   const tempDir = path.join(__dirname, `temp_${targetRepo}.git`);
   await fs.remove(tempDir);
 
   try {
+    // 1. 克隆上游裸仓
     run(`git clone --mirror "${upstream}" "${tempDir}"`);
-    run(`git push --mirror "${targetUrl}"`, tempDir);
+
+    // 2. 防跑路熔断检查：验证上游是否有有效提交，防止清空跑路
+    const commitCountStr = runSilent('git rev-list --count --all', tempDir);
+    const commitCount = parseInt(commitCountStr, 10);
+    if (isNaN(commitCount) || commitCount === 0) {
+      throw new Error(`熔断触发：上游仓库没有任何有效提交 (commits: 0)，疑似空仓或清空跑路，已阻断同步！`);
+    }
+
+    // 3. 安全防跑路推送：
+    // - 不带 --prune：上游哪怕删除分支或 Tag，备份仓绝对不删，永远留存
+    // - 精确推送 heads 和 tags：跳过 GitHub 保留的只读 refs/pull/* 隐形引用
+    // - 严格快进保护 (Fast-Forward Only)：默认禁止强制覆盖，防止上游恶意重写历史冲掉已有资产
+    const forcePrefix = item.force ? '+' : '';
+    run(`git push "${targetUrl}" "${forcePrefix}refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"`, tempDir);
+
     console.log(`✅ [Git Mirror] 镜像同步完成。`);
     logDetail('INFO', `[Git] 同步完成: ${targetRepo}`);
   } finally {
@@ -329,7 +344,7 @@ async function main() {
       await ensureRepo(item);
 
       if (item.type === 'git') {
-        await syncGit(item.upstream, item.target_repo);
+        await syncGit(item.upstream, item.target_repo, item);
       } else if (item.type === 'crate') {
         await syncCrate(item);
       } else {
