@@ -5,3 +5,4 @@ work/
 !keepalive.log
 .env
 .DS_Store
+agents.md
