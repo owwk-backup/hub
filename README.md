@@ -59,3 +59,11 @@ gh workflow run sync.yml --repo owwk-backup/hub
 gh run list --repo owwk-backup/hub
 gh run watch --repo owwk-backup/hub
 ```
+
+---
+
+## 生态扩展：一键加入备份 (One-Click Backup)
+
+本项目提供开箱即用的前端扩展套件，位于仓库目录：
+- **[userscript/vault-sync.user.js](file:///D:/Workspace/CodeSpace/hub/userscript/vault-sync.user.js)**：浏览器油猴脚本，完美融入 GitHub / Crates.io 原生 UI。
+- **[worker/index.js](file:///D:/Workspace/CodeSpace/hub/worker/index.js)**：Cloudflare Worker 极速异步网关代码，毫秒级响应并安全更新私有配置仓。
