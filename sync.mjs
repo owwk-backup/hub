@@ -158,58 +158,28 @@ async function syncGit(upstream, targetRepo, item = {}) {
   }
 }
 
-// 模式 2：同步 Crates.io 包至独立仓库的 main 分支
-async function getLatestCrateVersion(crateName) {
-  console.log(`🔎 [Crate API] 正在查询 crates.io 最新发布版本...`);
-  const response = await crateClient.get(`https://crates.io/api/v1/crates/${crateName}`);
-  const version = response.data?.crate?.max_stable_version || response.data?.crate?.max_version;
-  if (!version) throw new Error(`未在 crates.io 找到 ${crateName} 的有效版本`);
-  console.log(`📦 [Crate Version] 探测到最新版本: v${version}`);
-  logDetail('INFO', `[Crate] ${crateName} 最新版本为 v${version}`);
-  return version;
-}
+// 模式 2：全量历史版本链式重放与增量同步（复原完整版本迭代演进与原作者/时间戳）
+async function getAllCrateVersions(crateName) {
+  console.log(`🔎 [Crate API] 正在拉取 ${crateName} 的历史版本元数据...`);
+  const response = await crateClient.get(`https://crates.io/api/v1/crates/${crateName}/versions`);
+  const versions = response.data?.versions || [];
+  if (!versions.length) throw new Error(`未在 crates.io 找到 ${crateName} 的有效版本`);
 
-async function prepareRepo(targetRepoPath, targetRepo) {
-  await fs.remove(targetRepoPath);
-  await fs.ensureDir(targetRepoPath);
-
-  const cloneUrl = `https://x-access-token:${PAT}@github.com/${ORG_NAME}/${targetRepo}.git`;
-
-  try {
-    console.log(`📥 正在拉取目标仓库 main 分支...`);
-    runSilent(`git clone --branch main "${cloneUrl}" "${targetRepoPath}"`);
-  } catch (error) {
-    console.log(`ℹ️ 目标仓库尚为空，初始化本地仓库并绑定 main 分支...`);
-    runSilent('git init -b main', targetRepoPath);
-    runSilent(`git remote add origin "${cloneUrl}"`, targetRepoPath);
-  }
-
-  runSilent(`git config user.name "github-actions[bot]"`, targetRepoPath);
-  runSilent(`git config user.email "41898282+github-actions[bot]@users.noreply.github.com"`, targetRepoPath);
-}
-
-function checkCrateVersionExists(targetRepoPath, crateName, version) {
-  try {
-    const tags = runSilent('git tag', targetRepoPath).split('\n');
-    if (tags.includes(`${crateName}-v${version}`) || tags.includes(`v${version}`)) {
-      return true;
-    }
-  } catch {
-    // 忽略未产生 tag 的初始状态
-  }
-  return false;
+  // 按时间正序排序（从最早版本到最新版本）
+  versions.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  console.log(`📦 [Crate Versions] 成功解析 ${versions.length} 个版本 (最早: v${versions[0].num} @ ${versions[0].created_at.slice(0, 10)}, 最新: v${versions[versions.length - 1].num} @ ${versions[versions.length - 1].created_at.slice(0, 10)})`);
+  logDetail('INFO', `[Crate] ${crateName} 获取到 ${versions.length} 个历史版本`);
+  return versions;
 }
 
 async function downloadAndExtractCrate(crateName, version, targetRepoPath, workDir) {
-  console.log(`⬇️ 正在下载 .crate 包文件 (v${version}) 并执行解压校验...`);
   const downloadUrl = `https://static.crates.io/crates/${crateName}/${crateName}-${version}.crate`;
   const tarballPath = path.join(workDir, `${crateName}-${version}.crate`);
-  const extractDir = path.join(workDir, 'extracted');
+  const extractDir = path.join(workDir, `extracted_${version}`);
 
   await fs.remove(extractDir);
   await fs.ensureDir(extractDir);
 
-  const startTime = Date.now();
   const response = await crateClient.get(downloadUrl, { responseType: 'arraybuffer' });
   await fs.writeFile(tarballPath, response.data);
 
@@ -217,10 +187,8 @@ async function downloadAndExtractCrate(crateName, version, targetRepoPath, workD
     file: tarballPath,
     cwd: extractDir
   });
-  const cost = Date.now() - startTime;
-  console.log(`📦 包解压缩成功 (耗时: ${cost}ms)，整理工作树...`);
-  logDetail('INFO', `[Crate] 下载并解压 ${crateName} v${version} 成功，耗时 ${cost}ms`);
 
+  // 清空目标仓已有工作区文件（保留 .git）
   const items = await fs.readdir(targetRepoPath);
   for (const item of items) {
     if (item !== '.git') {
@@ -228,54 +196,133 @@ async function downloadAndExtractCrate(crateName, version, targetRepoPath, workD
     }
   }
 
-  const extractedSubDir = path.join(extractDir, `${crateName}-${version}`);
-  await fs.copy(extractedSubDir, targetRepoPath);
+  // 复制解压内容到目标仓根目录
+  const subDirs = await fs.readdir(extractDir);
+  const sourceDir = subDirs.length === 1 ? path.join(extractDir, subDirs[0]) : extractDir;
+  await fs.copy(sourceDir, targetRepoPath);
 
   await fs.remove(tarballPath);
   await fs.remove(extractDir);
 }
 
-function commitAndPushCrate(targetRepoPath, crateName, version) {
-  console.log(`📤 提交代码变动、打 Tag 并推送至独立仓库...`);
-  runSilent('git add .', targetRepoPath);
+function commitAndTagCrate(targetRepoPath, crateName, ver) {
+  const version = ver.num;
+  const authorName = ver.published_by?.name || ver.published_by?.login || 'Crates.io';
+  const authorLogin = ver.published_by?.login || 'crates';
+  const authorEmail = `${authorLogin}@users.noreply.github.com`;
+  const dateStr = ver.created_at;
 
-  const status = runSilent('git status --porcelain', targetRepoPath);
-  if (!status) {
-    console.log('ℹ️ 文件内容无更新，跳过提交。');
-    logDetail('INFO', `[Crate] ${crateName} 代码内容无变动`);
-  } else {
-    runSilent(`git commit -m "chore(sync): update to v${version}"`, targetRepoPath);
+  runSilent('git add -A', targetRepoPath);
+
+  const commitEnv = {
+    ...process.env,
+    GIT_AUTHOR_NAME: authorName,
+    GIT_AUTHOR_EMAIL: authorEmail,
+    GIT_AUTHOR_DATE: dateStr,
+    GIT_COMMITTER_NAME: authorName,
+    GIT_COMMITTER_EMAIL: authorEmail,
+    GIT_COMMITTER_DATE: dateStr
+  };
+
+  const msg = `release: ${crateName} v${version}`;
+  try {
+    execSync(`git commit --allow-empty -m "${msg}"`, { cwd: targetRepoPath, env: commitEnv, stdio: 'pipe' });
+  } catch (err) {
+    // 忽略空提交异常
   }
 
   const tagName = `v${version}`;
-  runSilent(`git tag -a "${tagName}" -m "Release ${tagName}"`, targetRepoPath);
-  runSilent(`git push origin main --tags`, targetRepoPath);
-  console.log(`✅ [Crate Synced] 推送完成，Release Tag: ${tagName}`);
-  logDetail('INFO', `[Crate] ${crateName} 成功推送到 main，Tag: ${tagName}`);
+  try {
+    execSync(`git tag -a "${tagName}" -m "Release ${crateName} ${tagName}"`, { cwd: targetRepoPath, env: commitEnv, stdio: 'pipe' });
+  } catch (err) {
+    // 忽略 tag 已存在异常
+  }
 }
 
 async function syncCrate(item) {
   const crateName = item.crate_name;
   const targetRepo = item.target_repo || crateName;
 
-  console.log(`🔄 [Crate Sync] 启动 Crate 专属同步流...`);
+  console.log(`🔄 [Crate Sync] 启动 Crate 专属全量版本与作者历史同步流...`);
   logDetail('INFO', `开始处理 Crate: ${crateName} -> 目标仓: ${targetRepo}`);
 
   const workDir = path.join(__dirname, 'work', crateName);
+  await fs.remove(workDir);
+  await fs.ensureDir(workDir);
+
   const targetRepoPath = path.join(workDir, 'repo');
+  const cloneUrl = `https://x-access-token:${PAT}@github.com/${ORG_NAME}/${targetRepo}.git`;
 
-  const version = await getLatestCrateVersion(crateName);
-  await prepareRepo(targetRepoPath, targetRepo);
+  const versions = await getAllCrateVersions(crateName);
+  const latestVer = versions[versions.length - 1];
 
-  if (checkCrateVersionExists(targetRepoPath, crateName, version)) {
-    console.log(`⏩ [Crate Skipped] 目标版本 v${version} 已经备份同步，跳过本次任务。`);
-    logDetail('INFO', `[Crate] ${crateName} v${version} 已备份同步，跳过`);
-    await fs.remove(workDir);
-    return;
+  // 1. 克隆或准备本地仓库
+  await fs.ensureDir(targetRepoPath);
+  let isRepoEmpty = false;
+  try {
+    runSilent(`git clone --branch main "${cloneUrl}" "${targetRepoPath}"`);
+  } catch {
+    isRepoEmpty = true;
+    runSilent('git init -b main', targetRepoPath);
+    runSilent(`git remote add origin "${cloneUrl}"`, targetRepoPath);
   }
 
-  await downloadAndExtractCrate(crateName, version, targetRepoPath, workDir);
-  commitAndPushCrate(targetRepoPath, crateName, version);
+  // 2. 检查现有 tags 与历史完整度
+  let existingTags = [];
+  try {
+    existingTags = runSilent('git tag', targetRepoPath).split('\n').map(t => t.trim()).filter(Boolean);
+  } catch {}
+
+  const earliestTag = `v${versions[0].num}`;
+  // 若缺失最早的版本 tag，说明之前仅同步过单次快照，自动开启全量历史重放
+  const needRebuild = isRepoEmpty || (!existingTags.includes(earliestTag) && versions.length > 1);
+
+  if (!needRebuild) {
+    // 增量模式：检查未同步的新版本
+    const pendingVersions = versions.filter(v => !existingTags.includes(`v${v.num}`));
+    if (pendingVersions.length === 0) {
+      console.log(`⏩ [Crate Skipped] ${crateName} 全量 ${versions.length} 个版本历史已就绪，跳过。`);
+      logDetail('INFO', `[Crate] ${crateName} 全量版本已最新 (最新: v${latestVer.num})，跳过`);
+      await fs.remove(workDir);
+      return;
+    }
+
+    console.log(`📦 [Crate Incremental] 检测到 ${pendingVersions.length} 个新版本待追加同步...`);
+    for (const ver of pendingVersions) {
+      console.log(`  ➕ 追加同步 v${ver.num} (${ver.created_at.slice(0, 10)})...`);
+      await downloadAndExtractCrate(crateName, ver.num, targetRepoPath, workDir);
+      commitAndTagCrate(targetRepoPath, crateName, ver);
+    }
+
+    console.log(`🚀 [Crate Push] 正在推送增量版本至 main...`);
+    runSilent(`git push origin main --tags`, targetRepoPath);
+    console.log(`✅ [Crate Synced] ${crateName} 增量同步完成。`);
+    logDetail('INFO', `[Crate] ${crateName} 追加同步了 ${pendingVersions.length} 个新版本`);
+  } else {
+    // 全量历史重构模式：从最早版本重建完整链条并还原作者
+    console.log(`🏗️ [Crate Rebuild] 目标仓尚未构建完整版本演进史，开始从 v${versions[0].num} 链式重构全部 ${versions.length} 个版本...`);
+    logDetail('INFO', `[Crate] ${crateName} 开始全量链式重放 ${versions.length} 个版本历史`);
+
+    // 重置为一个全新的本地 Git 仓库
+    await fs.remove(path.join(targetRepoPath, '.git'));
+    runSilent('git init -b main', targetRepoPath);
+    runSilent(`git remote add origin "${cloneUrl}"`, targetRepoPath);
+
+    for (let idx = 0; idx < versions.length; idx++) {
+      const ver = versions[idx];
+      const author = ver.published_by?.login || 'crates';
+      const progress = `[${idx + 1}/${versions.length}]`;
+      console.log(`  📦 ${progress} 重放 v${ver.num} | 发布者: ${author} | 日期: ${ver.created_at.slice(0, 10)}`);
+      await downloadAndExtractCrate(crateName, ver.num, targetRepoPath, workDir);
+      commitAndTagCrate(targetRepoPath, crateName, ver);
+    }
+
+    console.log(`🚀 [Crate Push] 历史链式构建完成，正在推送 main 分支与所有 ${versions.length} 个 Release Tags...`);
+    runSilent(`git push -f origin main --tags`, targetRepoPath);
+    console.log(`✅ [Crate Synced] ${crateName} 全量历史重构完成！`);
+    logDetail('INFO', `[Crate] ${crateName} 全量 ${versions.length} 个版本历史重构完成并推送`);
+  }
+
   await fs.remove(workDir);
 }
 
