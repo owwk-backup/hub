@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Vault 一键备份助手 (带自检诊断版)
+// @name         Vault 一键备份助手 (原生 GitHub 风格版)
 // @namespace    https://github.com/owwk-backup
-// @version      1.3.0
+// @version      1.4.0
 // @description  在 GitHub 顶栏原生嵌入“备份到 Vault”按钮，秒级异步入库
 // @author       owwk-backup
 // @match        *://github.com/*
@@ -9,7 +9,7 @@
 // @include      *://github.com/*
 // @include      *://*.github.com/*
 // @match        *://crates.io/*
-// @run-at       document-start
+// @run-at       document-end
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -20,8 +20,7 @@
 (function () {
     'use strict';
 
-    // 🌟 诊断点 1：确认油猴是否真的成功加载运行了本脚本
-    console.log('%c[Vault Userscript] 🚀 脚本已成功唤醒！当前地址:', 'color: #1f6feb; font-weight: bold;', location.href);
+    console.log('%c[Vault Userscript] 🚀 脚本已激活！当前地址:', 'color: #1f6feb; font-weight: bold;', location.href);
 
     function getConfig() {
         return {
@@ -98,27 +97,23 @@
         });
     }
 
+    // 核心注入函数
     function injectGitHub() {
-        if (document.getElementById('vault-backup-action-item')) return;
+        if (document.getElementById('vault-backup-action-item')) return true;
 
-        // 全维多路寻找目标按钮容器
-        const starBtn = document.querySelector('#star-button') || document.querySelector('[data-hydro-click*="star" i]');
-        const forkBtn = document.querySelector('#fork-button') || document.querySelector('[data-hydro-click*="fork" i]');
-        const watchBtn = document.querySelector('#repository-details-watch-button') || document.querySelector('#notifications-list-item');
+        // 万能多级定位：支持任意结构
+        const container = document.querySelector('ul.pagehead-actions') ||
+                          document.querySelector('.pagehead-actions') ||
+                          document.querySelector('#repository-details-container ul') ||
+                          document.querySelector('#star-button')?.closest('ul') ||
+                          document.querySelector('#fork-button')?.closest('ul') ||
+                          document.querySelector('#repository-details-watch-button')?.closest('ul');
 
-        const anchor = watchBtn || forkBtn || starBtn;
-        const actionsContainer = (anchor && anchor.closest('ul')) ||
-                                 document.querySelector('ul.pagehead-actions') || 
-                                 document.querySelector('#repository-details-container ul');
-        
-        if (!actionsContainer) {
-            return;
+        if (!container) {
+            return false;
         }
 
-        console.log('%c[Vault Userscript] ✅ 成功定位顶栏容器，开始注入按钮！', 'color: #2da44e; font-weight: bold;');
-
-        const li = document.createElement('li');
-        li.id = 'vault-backup-action-item';
+        console.log('%c[Vault Userscript] 🎉 成功定位顶栏容器，开始注入按钮！', 'color: #2da44e; font-weight: bold;', container);
 
         const btn = document.createElement('button');
         btn.type = 'button';
@@ -127,20 +122,29 @@
         btn.style.display = 'inline-flex';
         btn.style.alignItems = 'center';
         btn.style.marginRight = '8px';
+        btn.style.cursor = 'pointer';
 
         btn.innerHTML = `${ARCHIVE_ICON}<span class="vault-btn-text" style="font-weight: 600;">备份</span>`;
         const textSpan = btn.querySelector('.vault-btn-text');
-
         btn.onclick = () => triggerBackup(btn, textSpan);
 
-        li.appendChild(btn);
-        actionsContainer.insertBefore(li, actionsContainer.firstChild);
+        if (container.tagName === 'UL') {
+            const li = document.createElement('li');
+            li.id = 'vault-backup-action-item';
+            li.appendChild(btn);
+            container.insertBefore(li, container.firstChild);
+        } else {
+            btn.id = 'vault-backup-action-item';
+            container.insertBefore(btn, container.firstChild);
+        }
+
+        return true;
     }
 
     function injectCratesIo() {
-        if (document.getElementById('vault-backup-action-item')) return;
+        if (document.getElementById('vault-backup-action-item')) return true;
         const installSection = document.querySelector('[data-test-install]');
-        if (!installSection) return;
+        if (!installSection) return false;
 
         const btn = document.createElement('button');
         btn.id = 'vault-backup-action-item';
@@ -154,31 +158,35 @@
         const textSpan = btn.querySelector('.vault-btn-text');
         btn.onclick = () => triggerBackup(btn, textSpan);
         installSection.parentElement.insertBefore(btn, installSection.nextSibling);
+        return true;
     }
 
     function checkAndInject() {
         const host = location.hostname;
         if (host.includes('github.com')) {
-            injectGitHub();
+            return injectGitHub();
         } else if (host.includes('crates.io')) {
-            injectCratesIo();
+            return injectCratesIo();
         }
+        return false;
     }
 
-    // 立即执行与多重事件监听
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', checkAndInject);
-    } else {
-        checkAndInject();
-    }
+    // 1. 立即执行一次
+    checkAndInject();
 
+    // 2. 强力保底轮询（每 500ms 检查一次，一旦注入成功降低频率）
+    let timer = setInterval(() => {
+        const done = checkAndInject();
+        if (done) {
+            clearInterval(timer);
+            // 之后以低频监听 SPA 路由变化
+            setInterval(checkAndInject, 1500);
+        }
+    }, 500);
+
+    // 3. 事件驱动
+    document.addEventListener('DOMContentLoaded', checkAndInject);
     document.addEventListener('turbo:render', checkAndInject);
     document.addEventListener('turbo:load', checkAndInject);
     document.addEventListener('pjax:end', checkAndInject);
-
-    // 持续监听重绘
-    const observer = new MutationObserver(() => checkAndInject());
-    if (document.documentElement) {
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-    }
 })();
