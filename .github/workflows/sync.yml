@@ -1,0 +1,39 @@
+name: Global Org Sync Hub
+
+on:
+  schedule:
+    - cron: '27 3 * * *' # 每天 UTC 03:27 (北京时间 11:27) 自动同步
+  workflow_dispatch:    # 支持在 Actions 界面一键手动触发
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 允许提交保活 commit
+    steps:
+      - name: Checkout Hub
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Execute Sync
+        env:
+          ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: node sync.mjs
+
+      - name: Keepalive Workflow
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          date -u > keepalive.log
+          git add -f keepalive.log
+          git commit -m "chore: automated keepalive [skip ci]" || exit 0
+          git push

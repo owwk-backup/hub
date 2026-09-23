@@ -1,0 +1,7 @@
+node_modules/
+temp_*.git/
+work/
+*.log
+!keepalive.log
+.env
+.DS_Store
