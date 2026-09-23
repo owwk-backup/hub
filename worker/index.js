@@ -160,13 +160,24 @@ async function saveRemoteConfig(org, repo, list, sha, message, headers) {
   if (!res.ok) throw new Error(`写回配置仓失败: ${res.statusText}`);
 }
 
-// 帮助函数：触发 Action
+// 帮助函数：触发 Action 并严格检查响应
 async function triggerDispatch(org, repo, headers) {
-  await fetch(`https://api.github.com/repos/${org}/${repo}/actions/workflows/sync.yml/dispatches`, {
+  const url = `https://api.github.com/repos/${org}/${repo}/actions/workflows/sync.yml/dispatches`;
+  console.log(`[Dispatch] 发起触发请求: ${url}`);
+  
+  const res = await fetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify({ ref: 'main' })
   });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error(`❌ [Dispatch Failed HTTP ${res.status}]`, errorText);
+    throw new Error(`触发 GitHub Action 失败 [HTTP ${res.status}]: ${errorText}`);
+  }
+
+  console.log(`✅ [Dispatch Success] Action 同步工作流已成功触发！(HTTP ${res.status})`);
 }
 
 // 智能页面 URL 解析
