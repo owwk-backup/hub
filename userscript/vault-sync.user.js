@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vault 一键备份助手 (原生 GitHub 风格版)
 // @namespace    https://github.com/owwk-backup
-// @version      1.4.0
+// @version      1.5.0
 // @description  在 GitHub 顶栏原生嵌入“备份到 Vault”按钮，秒级异步入库
 // @author       owwk-backup
 // @match        *://github.com/*
@@ -39,7 +39,7 @@
     });
 
     const ARCHIVE_ICON = `
-    <svg aria-hidden="true" height="16" viewBox="0 0 16 16" version="1.1" width="16" class="octicon octicon-archive mr-1" style="vertical-align: text-bottom; fill: currentColor;">
+    <svg data-component="Octicon" aria-hidden="true" focusable="false" class="octicon octicon-archive" viewBox="0 0 16 16" width="16" height="16" fill="currentColor" display="inline-block" overflow="visible" style="vertical-align: text-bottom;">
         <path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v1.5A1.75 1.75 0 0 1 13.25 6H13v6.25A2.75 2.75 0 0 1 10.25 15h-4.5A2.75 2.75 0 0 1 3 12.25V6h-.25A1.75 1.75 0 0 1 1 4.25v-1.5Zm1.75-.25a.25.25 0 0 0-.25.25v1.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-1.5a.25.25 0 0 0-.25-.25H2.75ZM4.5 6v6.25c0 .69.56 1.25 1.25 1.25h4.5c.69 0 1.25-.56 1.25-1.25V6H4.5ZM6.75 7.75a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5a.75.75 0 0 1 .75-.75Zm3.25.75a.75.75 0 0 0-1.5 0v1.5a.75.75 0 0 0 1.5 0v-1.5Z"></path>
     </svg>`;
 
@@ -97,47 +97,52 @@
         });
     }
 
-    // 核心注入函数
+    // 精准注入 GitHub 最新的 React/Primer UI 架构
     function injectGitHub() {
         if (document.getElementById('vault-backup-action-item')) return true;
 
-        // 万能多级定位：支持任意结构
-        const container = document.querySelector('ul.pagehead-actions') ||
-                          document.querySelector('.pagehead-actions') ||
-                          document.querySelector('#repository-details-container ul') ||
-                          document.querySelector('#star-button')?.closest('ul') ||
-                          document.querySelector('#fork-button')?.closest('ul') ||
-                          document.querySelector('#repository-details-watch-button')?.closest('ul');
+        // 🌟 核心命中：GitHub 新版 React 顶栏容器
+        const container = document.querySelector('[data-testid="repo-header-actions"]') ||
+                          document.querySelector('[data-testid="notifications-subscriptions-menu-button"]')?.closest('ul') ||
+                          document.querySelector('[data-testid="fork-button"]')?.closest('ul') ||
+                          document.querySelector('[data-testid="star-button"]')?.closest('ul') ||
+                          document.querySelector('ul.pagehead-actions') ||
+                          document.querySelector('.pagehead-actions');
 
         if (!container) {
             return false;
         }
 
-        console.log('%c[Vault Userscript] 🎉 成功定位顶栏容器，开始注入按钮！', 'color: #2da44e; font-weight: bold;', container);
+        console.log('%c[Vault Userscript] 🎉 成功命中 repo-header-actions 顶栏容器！', 'color: #2da44e; font-weight: bold;', container);
 
+        const li = document.createElement('li');
+        li.id = 'vault-backup-action-item';
+
+        // 采用新版 GitHub 原生 button 样式结构
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'btn btn-sm';
+        btn.setAttribute('data-component', 'Button');
+        btn.setAttribute('data-size', 'small');
+        btn.setAttribute('data-variant', 'default');
+        btn.className = 'prc-Button-ButtonBase-9n-Xk btn-sm btn';
         btn.title = '将当前项目无感镜像备份至 owwk-backup 组织';
-        btn.style.display = 'inline-flex';
-        btn.style.alignItems = 'center';
-        btn.style.marginRight = '8px';
         btn.style.cursor = 'pointer';
 
-        btn.innerHTML = `${ARCHIVE_ICON}<span class="vault-btn-text" style="font-weight: 600;">备份</span>`;
+        btn.innerHTML = `
+            <span data-component="buttonContent" data-align="center" class="prc-Button-ButtonContent-Iohp5">
+                <span data-component="leadingVisual" class="prc-Button-Visual-YNt2F prc-Button-LeadingVisual-UySKu prc-Button-VisualWrap-E4cnq" style="margin-right: 4px;">
+                    ${ARCHIVE_ICON}
+                </span>
+                <span data-component="text" class="prc-Button-Label-FWkx3 vault-btn-text" style="font-weight: 600;">备份</span>
+            </span>
+        `;
+
         const textSpan = btn.querySelector('.vault-btn-text');
         btn.onclick = () => triggerBackup(btn, textSpan);
 
-        if (container.tagName === 'UL') {
-            const li = document.createElement('li');
-            li.id = 'vault-backup-action-item';
-            li.appendChild(btn);
-            container.insertBefore(li, container.firstChild);
-        } else {
-            btn.id = 'vault-backup-action-item';
-            container.insertBefore(btn, container.firstChild);
-        }
-
+        li.appendChild(btn);
+        // 插入到关注按钮（首个子节点）的最左侧
+        container.insertBefore(li, container.firstChild);
         return true;
     }
 
@@ -171,21 +176,18 @@
         return false;
     }
 
-    // 1. 立即执行一次
+    // 立即执行与多重事件监听
     checkAndInject();
 
-    // 2. 强力保底轮询（每 500ms 检查一次，一旦注入成功降低频率）
-    let timer = setInterval(() => {
-        const done = checkAndInject();
-        if (done) {
+    // 轮询直至成功注入
+    const timer = setInterval(() => {
+        if (checkAndInject()) {
             clearInterval(timer);
-            // 之后以低频监听 SPA 路由变化
+            // 降低频率以监听路由切换
             setInterval(checkAndInject, 1500);
         }
-    }, 500);
+    }, 300);
 
-    // 3. 事件驱动
-    document.addEventListener('DOMContentLoaded', checkAndInject);
     document.addEventListener('turbo:render', checkAndInject);
     document.addEventListener('turbo:load', checkAndInject);
     document.addEventListener('pjax:end', checkAndInject);
