@@ -30,13 +30,31 @@ export default {
     const ORG = env.GITHUB_ORG || 'owwk-backup';
     const CONFIG_REPO = env.CONFIG_REPO || 'config';
     const HUB_REPO = env.HUB_REPO || 'hub';
-    const PAT = env.GITHUB_PAT;
 
-    const ghHeaders = {
-      'Authorization': `Bearer ${PAT}`,
-      'Accept': 'application/vnd.github+json',
-      'User-Agent': 'Cloudflare-Worker-Vault-Bridge'
-    };
+    let ghHeaders;
+    try {
+      ghHeaders = await getGitHubHeaders(env);
+    } catch (e) {
+      const rawKey = env.GITHUB_APP_PRIVATE_KEY || '';
+      return new Response(JSON.stringify({
+        success: false,
+        error: `GitHub 凭据初始化失败: ${e.message}`,
+        debug: {
+          hasAppId: !!env.GITHUB_APP_ID,
+          hasInstId: !!env.GITHUB_APP_INSTALLATION_ID,
+          hasKey: !!env.GITHUB_APP_PRIVATE_KEY,
+          keyLength: rawKey.length,
+          keyStart: rawKey.slice(0, 35),
+          keyEnd: rawKey.slice(-35),
+          hasRsaHeader: rawKey.includes('BEGIN RSA PRIVATE KEY'),
+          hasPkcs8Header: rawKey.includes('BEGIN PRIVATE KEY'),
+          errorDetails: e.stack || e.message
+        }
+      }), {
+        status: 500,
+        headers: corsHeaders
+      });
+    }
 
     try {
       // 1. [PING] 服务健康检查与凭据测试
@@ -209,4 +227,145 @@ function parsePageInfo(urlStr) {
     }
   } catch {}
   return null;
+}
+
+// 统一凭据解析器：优先使用 GitHub App，回退使用个人 PAT
+async function getGitHubHeaders(env) {
+  let token = env.GITHUB_PAT;
+
+  if (env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY && env.GITHUB_APP_INSTALLATION_ID) {
+    token = await getAppInstallationToken(
+      env.GITHUB_APP_ID,
+      env.GITHUB_APP_PRIVATE_KEY,
+      env.GITHUB_APP_INSTALLATION_ID
+    );
+  }
+
+  if (!token) {
+    throw new Error('未配置有效的 GitHub App 凭据或 GITHUB_PAT');
+  }
+
+  return {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'Cloudflare-Worker-Vault-Bridge'
+  };
+}
+
+// 通过 WebCrypto 签署 JWT 并换取 GitHub App 临时安装令牌 (Installation Token)
+async function getAppInstallationToken(appId, privateKeyPem, installationId) {
+  const jwt = await generateAppJWT(appId, privateKeyPem);
+  const res = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${jwt}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'Cloudflare-Worker-Vault-Bridge'
+    }
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`获取 GitHub App Installation Token 失败 [HTTP ${res.status}]: ${errText}`);
+  }
+
+  const data = await res.json();
+  return data.token;
+}
+
+// 基于纯原生 WebCrypto (0 第三方依赖) 生成 RS256 JWT
+async function generateAppJWT(appId, rawPemStr) {
+  // 1. 标准化换行：兼容 Cloudflare Dashboard 自动转义的字面量 \n 与各类回车符
+  const normalizedPem = rawPemStr.replace(/\\n/g, '\n').replace(/\\r/g, '').trim();
+  let derBytes = pemToDer(normalizedPem);
+
+  if (!derBytes || derBytes.length === 0) {
+    throw new Error('解密后的 DER 字节序列为空，请检查私钥 Secret 格式');
+  }
+
+  // 智能结构侦测：如果头部是 PKCS#1 (RSA 裸私钥结构)，自动转封装为标准 PKCS#8
+  // PKCS#8 在 version 之后是 AlgorithmIdentifier (以 0x30 开头)
+  // PKCS#1 在 version 之后是 Modulus INTEGER (以 0x02 开头)
+  const isPkcs1 = (derBytes[0] === 0x30 && derBytes[4] === 0x02 && derBytes[7] === 0x02) 
+               || normalizedPem.includes('BEGIN RSA PRIVATE KEY');
+
+  if (isPkcs1) {
+    derBytes = pkcs1ToPkcs8(derBytes);
+  }
+
+  // 直接将 Uint8Array 传给 importKey，完全避免 ArrayBuffer 底层 byteOffset 错位问题
+  let key;
+  try {
+    key = await crypto.subtle.importKey(
+      'pkcs8',
+      derBytes,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+  } catch (importErr) {
+    throw new Error(`importKey 失败: ${importErr.message} (derLen=${derBytes.length}, isPkcs1=${isPkcs1}, byte0=${derBytes[0]?.toString(16)}, byte7=${derBytes[7]?.toString(16)})`);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = { iat: now - 60, exp: now + 600, iss: appId.toString() };
+
+  const signInput = `${b64Url(JSON.stringify(header))}.${b64Url(JSON.stringify(payload))}`;
+  const sigBuffer = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signInput)
+  );
+
+  return `${signInput}.${b64UrlBytes(new Uint8Array(sigBuffer))}`;
+}
+
+function pkcs1ToPkcs8(pkcs1Der) {
+  const prefix = new Uint8Array([
+    0x30, 0x82, 0x00, 0x00,
+    0x02, 0x01, 0x00,
+    0x30, 0x0d,
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    0x05, 0x00,
+    0x04, 0x82, 0x00, 0x00
+  ]);
+
+  const totalLen = prefix.length + pkcs1Der.length - 4;
+  prefix[2] = (totalLen >> 8) & 0xff;
+  prefix[3] = totalLen & 0xff;
+
+  const octetLen = pkcs1Der.length;
+  prefix[prefix.length - 2] = (octetLen >> 8) & 0xff;
+  prefix[prefix.length - 1] = octetLen & 0xff;
+
+  const res = new Uint8Array(prefix.length + pkcs1Der.length);
+  res.set(prefix, 0);
+  res.set(pkcs1Der, prefix.length);
+  return res;
+}
+
+function pemToDer(pemStr) {
+  const normalized = pemStr.replace(/\\n/g, '\n').replace(/\\r/g, '');
+  const lines = normalized.split('\n');
+  const b64Lines = lines.filter(line => !line.startsWith('-----') && line.trim().length > 0);
+  const b64 = b64Lines.join('').trim();
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function b64Url(str) {
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64UrlBytes(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return b64Url(binary);
 }
