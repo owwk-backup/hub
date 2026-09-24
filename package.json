@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "sync": "node sync.mjs",
-    "deploy": "wrangler deploy --config worker/wrangler.toml"
+    "deploy": "npx wrangler deploy --config worker/wrangler.toml"
   },
   "dependencies": {
     "axios": "^1.7.9",
