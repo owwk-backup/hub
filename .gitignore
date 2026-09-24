@@ -6,3 +6,6 @@ work/
 .env
 .DS_Store
 agents.md
+wrangler.toml
+**/wrangler.toml
+.wrangler/

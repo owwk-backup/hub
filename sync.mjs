@@ -124,10 +124,129 @@ async function ensureRepo(item) {
   }
 }
 
-// 模式 1：同步 Git 仓库全量镜像（防跑路防删模型）
+// 解析 upstream 是否为 GitHub 仓库
+function parseGitHubRepo(upstream) {
+  if (!upstream || typeof upstream !== 'string') return null;
+  const match = upstream.match(/github\.com[/:]([^/]+)\/([^/.]+)(?:\.git)?$/i);
+  if (!match) return null;
+  return { owner: match[1], repo: match[2] };
+}
+
+// 增量同步 GitHub Releases 与附件 Assets
+async function syncReleasesIfGitHub(upstream, targetRepo) {
+  const gh = parseGitHubRepo(upstream);
+  if (!gh) return;
+
+  console.log(`📦 [Release Sync] 检测到上游为 GitHub 仓库 (${gh.owner}/${gh.repo})，开始同步 Releases 与附件...`);
+  logDetail('INFO', `[Release] 开始检查 Releases: ${gh.owner}/${gh.repo} -> ${targetRepo}`);
+
+  try {
+    // 1. 获取上游所有 releases
+    let upstreamReleases = [];
+    try {
+      const res = await client.get(`/repos/${gh.owner}/${gh.repo}/releases?per_page=100`);
+      upstreamReleases = res.data || [];
+    } catch (e) {
+      if (e.response?.status === 404) {
+        logDetail('INFO', `[Release] 上游仓库无公开 releases`);
+        return;
+      }
+      throw e;
+    }
+
+    if (!upstreamReleases.length) {
+      console.log(`ℹ️ [Release Sync] 上游没有发布过任何 Release，跳过。`);
+      return;
+    }
+
+    // 2. 获取目标仓已有 releases
+    let targetReleases = [];
+    try {
+      const res = await client.get(`/repos/${ORG_NAME}/${targetRepo}/releases?per_page=100`);
+      targetReleases = res.data || [];
+    } catch (e) {
+      targetReleases = [];
+    }
+
+    const existingTags = new Set(targetReleases.map(r => r.tag_name));
+
+    // 从最早的 release 到最新的 release 顺序处理
+    const pendingReleases = upstreamReleases
+      .filter(r => !existingTags.has(r.tag_name))
+      .reverse();
+
+    if (!pendingReleases.length) {
+      console.log(`⏩ [Release Sync] 所有 ${upstreamReleases.length} 个 Release 均已同步，跳过。`);
+      return;
+    }
+
+    console.log(`🚀 [Release Sync] 检测到 ${pendingReleases.length} 个新 Release 待同步...`);
+
+    for (const rel of pendingReleases) {
+      console.log(`  ➕ 正在同步 Release [${rel.tag_name}] (${rel.name || rel.tag_name})...`);
+      logDetail('INFO', `[Release] 开始同步 ${rel.tag_name}`);
+
+      // 在目标仓创建对应的 Release
+      let createdRelease;
+      try {
+        const createRes = await client.post(`/repos/${ORG_NAME}/${targetRepo}/releases`, {
+          tag_name: rel.tag_name,
+          target_commitish: rel.target_commitish || 'main',
+          name: rel.name || rel.tag_name,
+          body: rel.body || '',
+          draft: false,
+          prerelease: rel.prerelease || false
+        });
+        createdRelease = createRes.data;
+      } catch (err) {
+        console.warn(`  ⚠️ 创建 Release [${rel.tag_name}] 失败: ${err.message}`);
+        logDetail('WARN', `[Release] 创建 ${rel.tag_name} 失败: ${err.message}`);
+        continue;
+      }
+
+      // 同步附件 Assets
+      const assets = rel.assets || [];
+      if (assets.length > 0) {
+        console.log(`    📎 包含 ${assets.length} 个附件，开始转存...`);
+        for (const asset of assets) {
+          try {
+            console.log(`      ⬇️ 下载附件: ${asset.name} (${(asset.size / 1024 / 1024).toFixed(2)} MB)...`);
+            const downloadRes = await axios.get(asset.browser_download_url, {
+              responseType: 'arraybuffer',
+              headers: { 'User-Agent': 'VaultSyncBot' }
+            });
+
+            console.log(`      ⬆️ 上传至备份仓: ${asset.name}...`);
+            const uploadUrl = createdRelease.upload_url.split('{')[0] + `?name=${encodeURIComponent(asset.name)}`;
+            await axios.post(uploadUrl, downloadRes.data, {
+              headers: {
+                Authorization: `Bearer ${PAT}`,
+                'Content-Type': asset.content_type || 'application/octet-stream',
+                'User-Agent': 'VaultSyncBot'
+              },
+              maxBodyLength: Infinity,
+              maxContentLength: Infinity
+            });
+            console.log(`      ✅ 附件转存成功: ${asset.name}`);
+          } catch (assetErr) {
+            console.warn(`      ⚠️ 转存附件 [${asset.name}] 失败: ${assetErr.message}`);
+            logDetail('WARN', `[Release] 转存附件 ${asset.name} 失败: ${assetErr.message}`);
+          }
+        }
+      }
+      logDetail('INFO', `[Release] 成功同步 ${rel.tag_name} 及 ${assets.length} 个附件`);
+    }
+    console.log(`✅ [Release Sync] Releases 同步完成。`);
+  } catch (err) {
+    console.warn(`⚠️ [Release Sync] Release 同步出现异常: ${err.message}`);
+    logDetail('WARN', `[Release] 同步异常: ${err.message}`);
+  }
+}
+
+// 模式 1：同步 Git 仓库全量镜像（防跑路 + 分叉自动归档保护模型）
 async function syncGit(upstream, targetRepo, item = {}) {
   const targetUrl = `https://x-access-token:${PAT}@github.com/${ORG_NAME}/${targetRepo}.git`;
-  console.log(`🔄 [Git Mirror] 正在执行镜像增量克隆与安全推送 (防跑路 Append-Only 模式)...`);
+  console.log(`🔄 [Git Mirror] 正在执行镜像增量克隆与安全推送 (防跑路 Append-Only + 分叉自动归档模式)...`);
   logDetail('INFO', `[Git] 开始同步 ${upstream} -> ${ORG_NAME}/${targetRepo}`);
 
   const tempDir = path.join(__dirname, `temp_${targetRepo}.git`);
@@ -144,19 +263,94 @@ async function syncGit(upstream, targetRepo, item = {}) {
       throw new Error(`熔断触发：上游仓库没有任何有效提交 (commits: 0)，疑似空仓或清空跑路，已阻断同步！`);
     }
 
-    // 3. 安全防跑路推送：
-    // - 不带 --prune：上游哪怕删除分支或 Tag，备份仓绝对不删，永远留存
-    // - 精确推送 heads 和 tags：跳过 GitHub 保留的只读 refs/pull/* 隐形引用
-    // - 严格快进保护 (Fast-Forward Only)：默认禁止强制覆盖，防止上游恶意重写历史冲掉已有资产
-    const forcePrefix = item.force ? '+' : '';
-    run(`git push "${targetUrl}" "${forcePrefix}refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"`, tempDir);
+    // 3. 配置备份仓远端，拉取备份仓分支指针进行分叉分析
+    runSilent(`git remote add backup "${targetUrl}"`, tempDir);
+
+    let hasTargetHeads = false;
+    try {
+      const remoteHeads = runSilent('git ls-remote --heads backup', tempDir);
+      if (remoteHeads && remoteHeads.trim().length > 0) {
+        hasTargetHeads = true;
+      }
+    } catch {
+      hasTargetHeads = false;
+    }
+
+    if (hasTargetHeads) {
+      try {
+        // 拉取备份仓的现有 heads 到本地镜像的 refs/backup-heads/*
+        runSilent(`git fetch backup "refs/heads/*:refs/backup-heads/*"`, tempDir);
+
+        const backupHeadsOutput = runSilent(`git for-each-ref --format="%(refname:short)" refs/backup-heads/`, tempDir);
+        const backupBranches = backupHeadsOutput
+          .split('\n')
+          .map(b => b.trim().replace(/^backup-heads\//, ''))
+          .filter(Boolean);
+
+        for (const branch of backupBranches) {
+          // 跳过此前已归档的历史分支，避免递归套娃归档
+          if (branch.startsWith('archive/')) continue;
+
+          // 检查上游裸仓是否存在同名分支
+          let upstreamHasBranch = false;
+          try {
+            runSilent(`git rev-parse --verify "refs/heads/${branch}"`, tempDir);
+            upstreamHasBranch = true;
+          } catch {
+            upstreamHasBranch = false;
+          }
+
+          if (upstreamHasBranch) {
+            // 判定：备份仓的 commit 是否为上游当前分支 commit 的直系祖先 (Fast-Forward 判定)
+            let isFastForward = false;
+            try {
+              runSilent(`git merge-base --is-ancestor "refs/backup-heads/${branch}" "refs/heads/${branch}"`, tempDir);
+              isFastForward = true;
+            } catch {
+              isFastForward = false;
+            }
+
+            if (!isFastForward) {
+              // 🚨 捕获分叉：上游发生了 Force Push / 偷删 Commit / 历史重写！
+              const nowStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+              const archiveBranch = `archive/${branch}-diverged-${nowStr}`;
+              console.log(`⚠️ [Anti-ForcePush] 检测到分支 [${branch}] 历史分叉 (上游发生了 Force Push 或删减 Commit)！`);
+              console.log(`🛡️ [Anti-ForcePush] 正在将备份仓原提交历史永久封存至分支 [${archiveBranch}]...`);
+              logDetail('WARN', `分支 [${branch}] 发生 Force Push / 篡改历史，已自动将备份仓原历史归档至 [${archiveBranch}]`);
+
+              // 将备份仓原分支指针推送到归档分支进行封存
+              runSilent(`git push backup "refs/backup-heads/${branch}:refs/heads/${archiveBranch}"`, tempDir);
+              console.log(`✅ [Anti-ForcePush] 分支 [${branch}] 原历史归档封存成功。`);
+            }
+          } else {
+            console.log(`ℹ️ [Branch Preserved] 上游已移除分支 [${branch}]，根据 Append-Only 策略，备份仓继续永久保留。`);
+            logDetail('INFO', `上游已移除分支 [${branch}]，备份仓予以保留`);
+          }
+        }
+      } catch (checkErr) {
+        console.warn(`⚠️ [Divergence Check Warning] 分叉检测出现警告: ${checkErr.message}，将继续推进安全同步。`);
+        logDetail('WARN', `分叉检测警告: ${checkErr.message}`);
+      }
+    }
+
+    // 4. 安全推送：
+    // - 不带 --prune：上游删除的分支/Tag 在备份仓中永久保留
+    // - 带 + 强制覆盖 refs/heads/*：因为发生分叉的分支已经全量归档封存至 archive/*，此时推进 heads 可以安全平滑追踪上游最新，杜绝 CI 管道死锁！
+    // - 标签 refs/tags/*:refs/tags/* 正常快进追加推送（防恶意覆写 Tag）
+    run(`git push backup "+refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"`, tempDir);
 
     console.log(`✅ [Git Mirror] 镜像同步完成。`);
     logDetail('INFO', `[Git] 同步完成: ${targetRepo}`);
   } finally {
     await fs.remove(tempDir);
   }
+
+  // 5. 增量同步 GitHub Releases 与附件 Assets
+  if (item.sync_releases !== false) {
+    await syncReleasesIfGitHub(upstream, targetRepo);
+  }
 }
+
 
 // 模式 2：全量历史版本链式重放与增量同步（复原完整版本迭代演进与原作者/时间戳）
 async function getAllCrateVersions(crateName) {

@@ -1,0 +1,4 @@
+# Cloudflare Worker 配置模板
+name = "my"
+main = "index.js"
+compatibility_date = "2024-01-01"
