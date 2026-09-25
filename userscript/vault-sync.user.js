@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Vault 一键备份助手 (原生 GitHub 风格 + 高级筛选排序面板版)
 // @namespace    https://github.com/owwk-backup
-// @version      2.2.0
+// @version      2.3.0
 // @description  原生 Starred 交互风格状态感知：左键备份/取消备份，右键开启控制台(高级筛选/排序/配置)
 // @author       owwk-backup
 // @match        *://github.com/*
@@ -20,6 +20,9 @@
 
 (function () {
     'use strict';
+
+    // 组织名称全局常量
+    const BACKUP_ORG = 'owwk-backup';
 
     // 默认配置
     function getConfig() {
@@ -159,28 +162,32 @@
         transform: translateX(-50%) !important; z-index: 10000000 !important;
     }
 
-    /* 类似 GitHub Starred 激活态的高亮与 hover 交互效果 */
+    .vault-repo-title {
+        font-size: 14px; font-weight: 600; color: var(--fgColor-default, #e6edf3);
+        text-decoration: none; display: inline-flex; align-items: center; gap: 4px;
+        transition: color 0.15s ease;
+    }
+    .vault-repo-title:hover {
+        color: #58a6ff; text-decoration: underline;
+    }
+    .vault-repo-link {
+        font-size: 12px; color: var(--fgColor-muted, #8b949e);
+        text-decoration: none; display: inline-block; max-width: 100%;
+        text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+        transition: color 0.15s ease;
+    }
+    .vault-repo-link:hover {
+        color: #58a6ff; text-decoration: underline;
+    }
+
+    /* 原生 GitHub 风格备份按钮 */
     .vault-action-btn {
         display: inline-flex !important; align-items: center !important;
         cursor: pointer !important; user-select: none !important;
-        transition: all 0.2s cubic-bezier(0.3, 0, 0.5, 1) !important;
     }
-    .vault-btn-backed {
-        background-color: rgba(56, 139, 253, 0.15) !important;
-        border-color: rgba(56, 139, 253, 0.45) !important;
-        color: #58a6ff !important;
-    }
+    /* 对标 GitHub 原生交互规范：仅对 icon 染色蓝色高亮，不污染按钮背景、边框及文字，hover 保持原生无多余特效 */
     .vault-btn-backed .octicon-archive {
         color: #58a6ff !important;
-    }
-    /* 已备份按钮悬停时，呈现准备取消备份 (Unstar) 的轻微警示红调 */
-    .vault-btn-backed:hover {
-        background-color: rgba(248, 81, 73, 0.12) !important;
-        border-color: rgba(248, 81, 73, 0.45) !important;
-        color: #f85149 !important;
-    }
-    .vault-btn-backed:hover .octicon-archive {
-        color: #f85149 !important;
     }
     @keyframes vaultFadeIn { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: scale(1); } }
     `;
@@ -250,19 +257,43 @@
         return null;
     }
 
-    // 本地持久化缓存读写
-    function getCachedRepos() {
+    // 缓存有效时长: 15 分钟
+    const CACHE_TTL_MS = 15 * 60 * 1000;
+
+    // 本地持久化缓存读写 (带 15 分钟 TTL 机制)
+    function getCachedReposData() {
         try {
-            const val = GM_getValue('VAULT_REPOS_CACHE', '[]');
-            return Array.isArray(val) ? val : JSON.parse(val || '[]');
+            const val = GM_getValue('VAULT_REPOS_CACHE', null);
+            if (!val) return { data: [], isExpired: true };
+            const parsed = typeof val === 'string' ? JSON.parse(val) : val;
+
+            // 兼容旧格式（纯数组结构）
+            if (Array.isArray(parsed)) {
+                return { data: parsed, isExpired: true };
+            }
+
+            const timestamp = parsed.timestamp || 0;
+            const isExpired = Date.now() - timestamp > CACHE_TTL_MS;
+            return {
+                data: Array.isArray(parsed.data) ? parsed.data : [],
+                isExpired
+            };
         } catch {
-            return [];
+            return { data: [], isExpired: true };
         }
+    }
+
+    function getCachedRepos() {
+        return getCachedReposData().data;
     }
 
     function setCachedRepos(list) {
         try {
-            GM_setValue('VAULT_REPOS_CACHE', Array.isArray(list) ? list : []);
+            const payload = {
+                timestamp: Date.now(),
+                data: Array.isArray(list) ? list : []
+            };
+            GM_setValue('VAULT_REPOS_CACHE', payload);
         } catch (e) {
             console.error('[Vault Cache Error]', e);
         }
@@ -328,10 +359,14 @@
         }
     }
 
-    // 后台静默校验与拉取清单缓存
-    function syncReposCacheSilently() {
+    // 后台静默校验与拉取清单缓存 (遵循 15 分钟 TTL 策略)
+    function syncReposCacheSilently(force = false) {
         const config = getConfig();
         if (!config.workerUrl || config.workerUrl.includes('your-worker-subdomain')) return;
+
+        const { isExpired } = getCachedReposData();
+        // 在 TTL 有效期内跳过后台请求
+        if (!force && !isExpired) return;
 
         callApi('/api/repos')
             .then((res) => {
@@ -385,17 +420,24 @@
         overlay.onclick = (e) => { if (e.target === overlay) closeModal(); };
         document.getElementById('vault-close-btn').onclick = closeModal;
 
-        // 全局状态缓存，用于即时 filter 和 sort
-        let rawReposList = [];
+        // 全局状态缓存，优先从本地持久化缓存加载，避免每次重复拉取
+        let rawReposList = getCachedRepos();
+        let currentTab = 'repos';
         let filterState = {
             search: '',
             type: 'all',
             access: 'all',
-            sort: 'default'
+            sort: 'newest'
         };
 
-        // Tab 1: 渲染清单列表 (含 Filter & Sort)
-        async function renderReposTab() {
+        // Tab 1: 渲染清单列表 (含 Filter & Sort 与防覆盖)
+        async function renderReposTab(forceRefresh = false) {
+            // 如果已有本地数据且并非手动点击刷新，直接秒开渲染
+            if (!forceRefresh && rawReposList && rawReposList.length > 0) {
+                drawReposView();
+                return;
+            }
+
             const body = document.getElementById('vault-modal-body');
             body.innerHTML = `<div style="text-align:center; padding: 50px; color: var(--fgColor-muted, #8b949e);">⏳ 正在从私有配置仓读取清单...</div>`;
 
@@ -404,17 +446,22 @@
                 rawReposList = res.data || [];
                 setCachedRepos(rawReposList);
                 refreshButtonStatusIfPresent();
-                drawReposView();
+                // 关键防御：仅当当前仍处于 repos tab 时才渲染视图，防止异步返回覆盖其他 Tab
+                if (currentTab === 'repos') {
+                    drawReposView();
+                }
             } catch (err) {
-                body.innerHTML = `
-                <div style="text-align:center; padding: 40px; color: #f85149;">
-                    <div style="font-size: 16px; margin-bottom: 8px;">⚠️ 读取清单失败</div>
-                    <div style="font-size: 13px; opacity: 0.8; margin-bottom: 16px;">${err.message}</div>
-                    <button type="button" class="vault-btn" id="vault-goto-settings-btn">👉 前往配置 Worker 凭证</button>
-                </div>
-                `;
-                const gotoBtn = document.getElementById('vault-goto-settings-btn');
-                if (gotoBtn) gotoBtn.onclick = () => switchTab('settings');
+                if (currentTab === 'repos') {
+                    body.innerHTML = `
+                    <div style="text-align:center; padding: 40px; color: #f85149;">
+                        <div style="font-size: 16px; margin-bottom: 8px;">⚠️ 读取清单失败</div>
+                        <div style="font-size: 13px; opacity: 0.8; margin-bottom: 16px;">${err.message}</div>
+                        <button type="button" class="vault-btn" id="vault-goto-settings-btn">👉 前往配置 Worker 凭证</button>
+                    </div>
+                    `;
+                    const gotoBtn = document.getElementById('vault-goto-settings-btn');
+                    if (gotoBtn) gotoBtn.onclick = () => switchTab('settings');
+                }
             }
         }
 
@@ -422,8 +469,11 @@
         function drawReposView() {
             const body = document.getElementById('vault-modal-body');
 
+            // 附带原始清单中的索引（反映添加先后顺序：索引越小越老，越大越新）
+            const reposWithIndex = rawReposList.map((item, idx) => ({ ...item, _rawIndex: idx }));
+
             // 1. 过滤 (Filter)
-            let filtered = rawReposList.filter(item => {
+            let filtered = reposWithIndex.filter(item => {
                 const targetName = (item.target_repo || item.crate_name || '').toLowerCase();
                 const upstream = (item.upstream || item.homepage || '').toLowerCase();
                 const keyword = filterState.search.toLowerCase().trim();
@@ -446,11 +496,20 @@
             // 2. 排序 (Sort)
             let sorted = [...filtered];
             switch (filterState.sort) {
+                case 'newest':
+                    // 从新到老：后添加的项目排在前面
+                    sorted.sort((a, b) => b._rawIndex - a._rawIndex);
+                    break;
+                case 'oldest':
+                case 'default':
+                    // 从老到新：先添加的项目排在前面
+                    sorted.sort((a, b) => a._rawIndex - b._rawIndex);
+                    break;
                 case 'name-asc':
-                    sorted.sort((a, b) => (a.target_repo || '').localeCompare(b.target_repo || ''));
+                    sorted.sort((a, b) => (a.target_repo || a.crate_name || '').localeCompare(b.target_repo || b.crate_name || ''));
                     break;
                 case 'name-desc':
-                    sorted.sort((a, b) => (b.target_repo || '').localeCompare(a.target_repo || ''));
+                    sorted.sort((a, b) => (b.target_repo || b.crate_name || '').localeCompare(a.target_repo || a.crate_name || ''));
                     break;
                 case 'type-git':
                     sorted.sort((a, b) => (a.type === 'git' ? -1 : 1));
@@ -459,7 +518,7 @@
                     sorted.sort((a, b) => (a.type === 'crate' ? -1 : 1));
                     break;
                 default:
-                    // default 保持原样
+                    sorted.sort((a, b) => b._rawIndex - a._rawIndex);
                     break;
             }
 
@@ -497,7 +556,8 @@
                     </select>
 
                     <select id="vault-filter-sort" class="vault-select">
-                        <option value="default" ${filterState.sort === 'default' ? 'selected' : ''}>排序: 默认顺序</option>
+                        <option value="newest" ${filterState.sort === 'newest' ? 'selected' : ''}>排序: 从新到老</option>
+                        <option value="oldest" ${filterState.sort === 'oldest' ? 'selected' : ''}>排序: 从老到新</option>
                         <option value="name-asc" ${filterState.sort === 'name-asc' ? 'selected' : ''}>排序: 名称 A-Z</option>
                         <option value="name-desc" ${filterState.sort === 'name-desc' ? 'selected' : ''}>排序: 名称 Z-A</option>
                         <option value="type-git" ${filterState.sort === 'type-git' ? 'selected' : ''}>排序: Git 镜像优先</option>
@@ -519,18 +579,34 @@
                     const isGit = item.type === 'git';
                     const tagClass = isGit ? 'vault-tag-git' : 'vault-tag-crate';
                     const targetName = item.target_repo || item.crate_name;
-                    const subUrl = item.upstream || item.homepage || '';
+
+                    // 跳转到我们备份仓库的地址
+                    const ourRepoUrl = `https://github.com/${BACKUP_ORG}/${targetName}`;
+
+                    // 跳转到原仓库/原页面地址
+                    let originUrl = item.homepage || '';
+                    if (!originUrl) {
+                        if (isGit && item.upstream) {
+                            originUrl = item.upstream.replace(/\.git$/, '');
+                        } else if (!isGit && item.crate_name) {
+                            originUrl = `https://crates.io/crates/${item.crate_name}`;
+                        }
+                    }
 
                     html += `
                     <div class="vault-item-card" data-repo="${escapeHtml(targetName)}">
                         <div style="min-width: 0; flex: 1;">
                             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
                                 <span class="vault-tag ${tagClass}">${item.type}</span>
-                                <strong style="font-size: 14px;">${escapeHtml(targetName)}</strong>
+                                <a href="${escapeHtml(ourRepoUrl)}" target="_blank" rel="noopener noreferrer" class="vault-repo-title" title="跳转至备份仓库: ${escapeHtml(ourRepoUrl)}">
+                                    ${escapeHtml(targetName)}
+                                </a>
                                 ${item.private ? '<span style="font-size: 11px; opacity: 0.6;">🔒 Private</span>' : '<span style="font-size: 11px; opacity: 0.6;">🌐 Public</span>'}
                             </div>
-                            <div style="font-size: 12px; color: var(--fgColor-muted, #8b949e); text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">
-                                ${escapeHtml(subUrl)}
+                            <div style="margin-top: 2px;">
+                                <a href="${escapeHtml(originUrl)}" target="_blank" rel="noopener noreferrer" class="vault-repo-link" title="跳转至原仓库/主页: ${escapeHtml(originUrl)}">
+                                    ${escapeHtml(originUrl)}
+                                </a>
                             </div>
                         </div>
                         <div>
@@ -572,8 +648,8 @@
                 drawReposView();
             };
 
-            // 绑定刷新
-            document.getElementById('vault-refresh-btn').onclick = renderReposTab;
+            // 绑定刷新（强制从远程更新并写回缓存）
+            document.getElementById('vault-refresh-btn').onclick = () => renderReposTab(true);
 
             // 绑定手动触发同步
             document.getElementById('vault-sync-btn').onclick = async function () {
@@ -591,7 +667,7 @@
                 }
             };
 
-            // 绑定单个删除
+            // 绑定单个删除（直接更新缓存与界面）
             body.querySelectorAll('.vault-delete-item-btn').forEach(btn => {
                 btn.onclick = async function () {
                     const target = this.getAttribute('data-target');
@@ -602,9 +678,11 @@
                     try {
                         await callApi('/api/repos', 'DELETE', { target_repo: target });
                         removeTargetFromCache(target);
+                        rawReposList = rawReposList.filter(item => (item.target_repo || item.crate_name || item) !== target);
+                        setCachedRepos(rawReposList);
                         refreshButtonStatusIfPresent();
                         showToast(`✅ 已成功移除 ${target}`);
-                        renderReposTab();
+                        drawReposView();
                     } catch (err) {
                         showToast(`❌ 移除失败: ${err.message}`);
                         this.disabled = false;
@@ -672,13 +750,15 @@
 
         // 标签切换逻辑
         function switchTab(tabName) {
+            if (currentTab === tabName) return;
+            currentTab = tabName;
             const tabRepos = document.getElementById('vault-tab-repos');
             const tabSettings = document.getElementById('vault-tab-settings');
 
             if (tabName === 'repos') {
                 tabRepos.classList.add('active');
                 tabSettings.classList.remove('active');
-                renderReposTab();
+                renderReposTab(false);
             } else {
                 tabSettings.classList.add('active');
                 tabRepos.classList.remove('active');
@@ -689,8 +769,8 @@
         document.getElementById('vault-tab-repos').onclick = () => switchTab('repos');
         document.getElementById('vault-tab-settings').onclick = () => switchTab('settings');
 
-        // 初始打开清单页
-        renderReposTab();
+        // 初始打开清单页（优先使用缓存，零延迟）
+        renderReposTab(false);
     }
 
     function escapeHtml(str) {
@@ -773,12 +853,6 @@
         const target = getCurrentPageTarget();
         if (!target) return false;
 
-        const existingItem = document.getElementById('vault-backup-action-item');
-        if (existingItem) {
-            refreshButtonStatusIfPresent();
-            return true;
-        }
-
         const container = document.querySelector('[data-testid="repo-header-actions"]') ||
                           document.querySelector('[data-testid="notifications-subscriptions-menu-button"]')?.closest('ul') ||
                           document.querySelector('[data-testid="fork-button"]')?.closest('ul') ||
@@ -786,6 +860,18 @@
                           document.querySelector('ul.pagehead-actions');
 
         if (!container) return false;
+
+        const existingItem = document.getElementById('vault-backup-action-item');
+        // 关键守卫：只有当 existingItem 确实处于当前活跃父容器中时，才算挂载成功
+        if (existingItem && container.contains(existingItem)) {
+            refreshButtonStatusIfPresent();
+            return true;
+        }
+
+        // 如果旧节点存在但已脱离当前容器（如被汉化插件替换重建了父容器），予以清理
+        if (existingItem) {
+            try { existingItem.remove(); } catch {}
+        }
 
         const li = document.createElement('li');
         li.id = 'vault-backup-action-item';
@@ -827,7 +913,7 @@
         li.appendChild(btn);
         container.insertBefore(li, container.firstChild);
 
-        // 静默向 Worker 同步最新清单缓存
+        // 静默向 Worker 同步最新清单缓存 (遵循 15 分钟 TTL 策略)
         syncReposCacheSilently();
         return true;
     }
@@ -840,13 +926,45 @@
         return false;
     }
 
-    // 监听与保底
+    // 1. 初次尝试注入
     checkAndInject();
-    const timer = setInterval(() => {
-        if (checkAndInject()) clearInterval(timer);
-    }, 300);
 
-    // 适配 GitHub Turbo 单页导航，换页时自动刷新状态
+    // 2. 引入防抖 MutationObserver，抵御汉化插件重建 DOM 或页面异步加载
+    let injectDebounceTimer = null;
+    function triggerDebouncedInject() {
+        if (injectDebounceTimer) clearTimeout(injectDebounceTimer);
+        injectDebounceTimer = setTimeout(() => {
+            checkAndInject();
+        }, 150);
+    }
+
+    const observer = new MutationObserver(() => {
+        if (getCurrentPageTarget()) {
+            const existing = document.getElementById('vault-backup-action-item');
+            if (!existing || !document.body.contains(existing)) {
+                triggerDebouncedInject();
+            }
+        }
+    });
+
+    try {
+        observer.observe(document.documentElement || document.body, {
+            childList: true,
+            subtree: true
+        });
+    } catch {}
+
+    // 3. 低频保底心跳轮询（每 1.5 秒），开销可忽略不计，确保极致抗干扰
+    setInterval(() => {
+        if (getCurrentPageTarget()) {
+            const existing = document.getElementById('vault-backup-action-item');
+            if (!existing || !document.body.contains(existing)) {
+                checkAndInject();
+            }
+        }
+    }, 1500);
+
+    // 4. 适配 GitHub Turbo / PJAX 单页导航
     document.addEventListener('turbo:render', () => {
         checkAndInject();
         refreshButtonStatusIfPresent();
