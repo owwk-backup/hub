@@ -84,26 +84,66 @@ async function fetchConfig() {
   }
 }
 
+// 解析 upstream 是否为 GitHub 仓库
+function parseGitHubRepo(upstream) {
+  if (!upstream || typeof upstream !== 'string') return null;
+  const match = upstream.match(/github\.com[/:]([^/]+)\/([^/.]+)(?:\.git)?$/i);
+  if (!match) return null;
+  return { owner: match[1], repo: match[2] };
+}
+
+// 自动拉取上游项目的真实简介 (About 原文)，不再添加任何模板前缀
+async function fetchUpstreamDescription(item) {
+  if (item.description !== undefined && item.description !== null) {
+    return item.description;
+  }
+
+  try {
+    if (item.type === 'git') {
+      const gh = parseGitHubRepo(item.upstream);
+      if (gh) {
+        const res = await client.get(`/repos/${gh.owner}/${gh.repo}`);
+        if (res.data && res.data.description) {
+          return res.data.description.trim();
+        }
+      }
+    } else if (item.type === 'crate') {
+      const crateName = item.crate_name || item.target_repo;
+      const res = await crateClient.get(`https://crates.io/api/v1/crates/${crateName}`);
+      if (res.data?.crate?.description) {
+        return res.data.crate.description.trim();
+      }
+    }
+  } catch (err) {
+    console.log(`⚠️ [Repo Meta] 无法拉取上游 About 简介 (${err.message})，将使用留空`);
+  }
+
+  return '';
+}
+
 // 检查仓库是否存在，不存在则自动在组织内创建独立仓库，并维护描述与原仓库链接
 async function ensureRepo(item) {
   const repoName = item.target_repo || item.crate_name;
   const isPrivate = item.private ?? true;
-  const homepage = item.homepage || (item.type === 'git' ? item.upstream : `https://crates.io/crates/${item.crate_name}`);
-  const description = item.description || (item.type === 'git' ? `Upstream mirror for ${item.upstream}` : `Upstream mirror for ${item.crate_name} crate`);
+  const homepage = item.homepage || (item.type === 'git' ? (item.upstream ? item.upstream.replace(/\.git$/, '') : '') : `https://crates.io/crates/${item.crate_name}`);
+  const description = await fetchUpstreamDescription(item);
 
   try {
     const res = await client.get(`/repos/${ORG_NAME}/${repoName}`);
     console.log(`✅ [Repo Ready] 目标仓库已就绪。`);
     logDetail('INFO', `仓库 ${ORG_NAME}/${repoName} 已就绪。Homepage: ${homepage}`);
 
-    if (res.data.description !== description || res.data.homepage !== homepage) {
-      console.log(`📝 [Repo Meta] 正在同步仓库元数据...`);
+    const currentDesc = res.data.description || '';
+    const currentHomepage = res.data.homepage || '';
+
+    if (currentDesc !== description || currentHomepage !== homepage) {
+      console.log(`📝 [Repo Meta] 正在同步仓库元数据（About 原文与 Homepage）...`);
       await client.patch(`/repos/${ORG_NAME}/${repoName}`, {
         description,
         homepage
       });
       console.log(`✅ [Repo Meta] 元数据更新完成。`);
-      logDetail('INFO', `仓库 ${repoName} 元数据已更新至最新。`);
+      logDetail('INFO', `仓库 ${repoName} 元数据已更新至最新。Description: "${description}"`);
     }
   } catch (err) {
     if (err.response?.status === 404) {
@@ -116,20 +156,12 @@ async function ensureRepo(item) {
         homepage
       });
       console.log(`✅ [Repo Created] 独立仓库创建成功。`);
-      logDetail('INFO', `独立仓库 ${ORG_NAME}/${repoName} 创建成功。`);
+      logDetail('INFO', `独立仓库 ${ORG_NAME}/${repoName} 创建成功。Description: "${description}"`);
     } else {
       logDetail('ERROR', `检查/创建仓库失败: ${err.message}`);
       throw err;
     }
   }
-}
-
-// 解析 upstream 是否为 GitHub 仓库
-function parseGitHubRepo(upstream) {
-  if (!upstream || typeof upstream !== 'string') return null;
-  const match = upstream.match(/github\.com[/:]([^/]+)\/([^/.]+)(?:\.git)?$/i);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2] };
 }
 
 // 增量同步 GitHub Releases 与附件 Assets
