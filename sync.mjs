@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs-extra';
@@ -10,23 +11,89 @@ const __dirname = path.dirname(__filename);
 
 // 读取组织名称与访问凭证
 const ORG_NAME = process.env.GITHUB_REPOSITORY_OWNER || 'owwk-backup';
-const PAT = process.env.ORG_ADMIN_PAT || process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
 const CONFIG_REPO = process.env.CONFIG_REPO || 'config';
 
-if (!PAT) {
-  console.error('❌ [Fatal] 缺少访问凭据：请配置环境变量 ORG_ADMIN_PAT');
-  process.exit(1);
+// 运行时凭据：由 initAuth() 在启动时填充（App 优先，PAT 兜底）
+let PAT = null;
+let client = null;
+
+// 将可能以字面量 \n 存储的私钥还原为真实换行（CI Secret 常见形态）
+function normalizePrivateKey(raw) {
+  return String(raw).replace(/\\n/g, '\n').replace(/\\r/g, '').trim();
 }
 
-// GitHub API 客户端
-const client = axios.create({
-  baseURL: 'https://api.github.com',
-  headers: {
-    Authorization: `Bearer ${PAT}`,
-    Accept: 'application/vnd.github+json',
-    'User-Agent': 'VaultSyncBot'
+// 用 App 私钥签出 RS256 JWT（iss = App ID；GitHub 要求 exp 距 iat 不超过 10 分钟）
+function signAppJWT(appId, privateKeyPem) {
+  const now = Math.floor(Date.now() / 1000);
+  const b64u = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const head = b64u({ alg: 'RS256', typ: 'JWT' });
+  const payload = b64u({ iat: now - 60, exp: now + 540, iss: String(appId) });
+  const signature = crypto
+    .createSign('RSA-SHA256')
+    .update(`${head}.${payload}`)
+    .sign(privateKeyPem)
+    .toString('base64url');
+  return `${head}.${payload}.${signature}`;
+}
+
+// 用 JWT 换取 GitHub App 的 Installation Token（有效期 1 小时，供本次任务使用）
+async function getAppInstallationToken(appId, privateKeyPem, installationId) {
+  const jwt = signAppJWT(appId, privateKeyPem);
+  const res = await axios.post(
+    `https://api.github.com/app/installations/${installationId}/access_tokens`,
+    null,
+    {
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'VaultSyncBot'
+      }
+    }
+  );
+  return res.data.token;
+}
+
+// 凭据解析：优先 GitHub App（发布行为归属 <app>[bot]），否则回退个人 PAT
+// 注意：GitHub 禁止 Actions 的 Secret / Variable 使用 GITHUB_ 前缀，故此处统一使用 VAULT_APP_ 命名
+async function initAuth() {
+  const appId = process.env.VAULT_APP_ID;
+  const rawKey = process.env.VAULT_APP_PRIVATE_KEY;
+  const installationId = process.env.VAULT_APP_INSTALLATION_ID;
+
+  if (appId && rawKey && installationId) {
+    console.log('🔑 [Auth] 检测到 GitHub App 凭据，正在签发 Installation Token...');
+    try {
+      PAT = await getAppInstallationToken(appId, normalizePrivateKey(rawKey), installationId);
+      console.log(`✅ [Auth] 已启用 GitHub App 身份 (App ID: ${appId})，发布行为不再归属个人账号。`);
+    } catch (err) {
+      const detail = err.response
+        ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}`
+        : err.message;
+      throw new Error(`GitHub App 凭据签发失败：${detail}`);
+    }
+  } else {
+    PAT = process.env.ORG_ADMIN_PAT || process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+    if (PAT) {
+      console.log('⚠️ [Auth] 未检测到完整 App 凭据，回退使用 PAT（发布行为将归属该令牌所有者）。');
+    }
   }
-});
+
+  if (!PAT) {
+    throw new Error(
+      '缺少访问凭据：请配置 VAULT_APP_ID / VAULT_APP_PRIVATE_KEY / VAULT_APP_INSTALLATION_ID，或 ORG_ADMIN_PAT'
+    );
+  }
+
+  // GitHub API 客户端
+  client = axios.create({
+    baseURL: 'https://api.github.com',
+    headers: {
+      Authorization: `Bearer ${PAT}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'VaultSyncBot'
+    }
+  });
+}
 
 // Crates.io 客户端
 const crateClient = axios.create({
@@ -164,6 +231,57 @@ async function ensureRepo(item) {
   }
 }
 
+// 元信息块哨兵：用于幂等重建，避免重复同步时层层叠加
+const META_BEGIN = '<!-- vault-sync:meta:begin -->';
+const META_END = '<!-- vault-sync:meta:end -->';
+const SYNC_ID_RE = /vault-sync:upstream-id=(\d+)/;
+const SUPERSEDED_SUFFIX = ' ｜ ⚠️ 已被上游重新发布取代';
+
+// ISO 时间转为可读的 UTC 文本
+function fmtUtc(iso) {
+  if (!iso) return '（未知）';
+  return iso.replace('T', ' ').replace('Z', ' UTC');
+}
+
+// 读取 body 中登记的同步来源 Release ID（作为「是否已同步」的权威指纹）
+function extractSyncId(body) {
+  const m = SYNC_ID_RE.exec(body || '');
+  return m ? m[1] : null;
+}
+
+// 构建置于 body 开头的原始发布元信息块（尾部附机器锚点，供下次比对上游 id）
+function buildMetaBlock(owner, repo, rel) {
+  const author = rel.author?.login;
+  const authorText = author ? `[@${author}](https://github.com/${author})` : '（未知）';
+  const releaseUrl = `https://github.com/${owner}/${repo}/releases/tag/${rel.tag_name}`;
+  const anchor = `<!-- vault-sync:upstream-id=${rel.id} upstream-published=${rel.published_at || ''} -->`;
+  return [
+    META_BEGIN,
+    '> **📌 原始发布信息（镜像自上游）**',
+    '>',
+    `> - 发布者：${authorText}`,
+    `> - 创建时间：${fmtUtc(rel.created_at)}`,
+    `> - 发布时间：${fmtUtc(rel.published_at)}`,
+    `> - 上游发布页：${releaseUrl}`,
+    anchor,
+    META_END
+  ].join('\n');
+}
+
+// 剥离可能存在的历史元信息块后重新拼接，保证重复同步不会重复叠加
+function composeBody(owner, repo, rel) {
+  let original = rel.body || '';
+  const begin = original.indexOf(META_BEGIN);
+  if (begin !== -1) {
+    const end = original.indexOf(META_END, begin);
+    if (end !== -1) {
+      original = original.slice(end + META_END.length).replace(/^\s*\n/, '');
+    }
+  }
+  const meta = buildMetaBlock(owner, repo, rel);
+  return original.trim() ? `${meta}\n\n${original}` : `${meta}\n`;
+}
+
 // 增量同步 GitHub Releases 与附件 Assets
 async function syncReleasesIfGitHub(upstream, targetRepo) {
   const gh = parseGitHubRepo(upstream);
@@ -191,7 +309,7 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
       return;
     }
 
-    // 2. 获取目标仓已有 releases
+    // 2. 获取目标仓已有 releases（按 tag 归组，同名 tag 可能并存多个对象）
     let targetReleases = [];
     try {
       const res = await client.get(`/repos/${ORG_NAME}/${targetRepo}/releases?per_page=100`);
@@ -200,36 +318,67 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
       targetReleases = [];
     }
 
-    const existingTags = new Set(targetReleases.map(r => r.tag_name));
-
-    // 从最早的 release 到最新的 release 顺序处理
-    const pendingReleases = upstreamReleases
-      .filter(r => !existingTags.has(r.tag_name))
-      .reverse();
-
-    if (!pendingReleases.length) {
-      console.log(`⏩ [Release Sync] 所有 ${upstreamReleases.length} 个 Release 均已同步，跳过。`);
-      return;
+    const targetByTag = new Map();
+    for (const r of targetReleases) {
+      if (!targetByTag.has(r.tag_name)) targetByTag.set(r.tag_name, []);
+      targetByTag.get(r.tag_name).push(r);
     }
 
-    console.log(`🚀 [Release Sync] 检测到 ${pendingReleases.length} 个新 Release 待同步...`);
+    // 从最早的 release 到最新的 release 顺序处理
+    const ordered = [...upstreamReleases].reverse();
 
-    for (const rel of pendingReleases) {
+    let createdCount = 0;
+    let skippedCount = 0;
+
+    for (const rel of ordered) {
+      const sameTag = targetByTag.get(rel.tag_name) || [];
+      const upstreamId = String(rel.id);
+
+      // 已同步判定：同名 tag 的 Release 中，存在锚点记录且上游 id 一致
+      const alreadySynced = sameTag.find(t => extractSyncId(t.body) === upstreamId);
+      if (alreadySynced) {
+        skippedCount++;
+        continue;
+      }
+
+      if (sameTag.length > 1) {
+        console.warn(`  ⚠️ [Duplicate] 目标仓 tag [${rel.tag_name}] 存在 ${sameTag.length} 个 Release 对象，将只按最新上游版本推进。`);
+        logDetail('WARN', `[Release] tag ${rel.tag_name} 在目标仓存在 ${sameTag.length} 个重复对象`);
+      }
+
+      // 上游对同一 tag 重新发布（或首次接管无锚点的历史 Release）：
+      // 老 Release 的内容与资产完整保留，仅在其 name 上追加取代标记，绝不覆盖或删除
+      for (const old of sameTag) {
+        const oldName = old.name || old.tag_name;
+        if (oldName.includes(SUPERSEDED_SUFFIX)) continue;
+        try {
+          await client.patch(`/repos/${ORG_NAME}/${targetRepo}/releases/${old.id}`, {
+            name: `${oldName}${SUPERSEDED_SUFFIX}`
+          });
+          console.log(`  🗂️ [Superseded] 已将旧 Release [${rel.tag_name}] 标记为被取代（原内容与资产保留）。`);
+          logDetail('INFO', `[Release] 旧 Release ${rel.tag_name} (id=${old.id}) 已标记为被上游重新发布取代`);
+        } catch (markErr) {
+          console.warn(`  ⚠️ 标记旧 Release [${rel.tag_name}] 失败: ${markErr.message}`);
+          logDetail('WARN', `[Release] 标记旧 Release ${rel.tag_name} 失败: ${markErr.message}`);
+        }
+      }
+
       console.log(`  ➕ 正在同步 Release [${rel.tag_name}] (${rel.name || rel.tag_name})...`);
       logDetail('INFO', `[Release] 开始同步 ${rel.tag_name}`);
 
-      // 在目标仓创建对应的 Release
+      // 在目标仓创建对应的 Release（body 开头写入原始发布元信息）
       let createdRelease;
       try {
         const createRes = await client.post(`/repos/${ORG_NAME}/${targetRepo}/releases`, {
           tag_name: rel.tag_name,
           target_commitish: rel.target_commitish || 'main',
           name: rel.name || rel.tag_name,
-          body: rel.body || '',
+          body: composeBody(gh.owner, gh.repo, rel),
           draft: false,
           prerelease: rel.prerelease || false
         });
         createdRelease = createRes.data;
+        createdCount++;
       } catch (err) {
         console.warn(`  ⚠️ 创建 Release [${rel.tag_name}] 失败: ${err.message}`);
         logDetail('WARN', `[Release] 创建 ${rel.tag_name} 失败: ${err.message}`);
@@ -268,7 +417,12 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
       }
       logDetail('INFO', `[Release] 成功同步 ${rel.tag_name} 及 ${assets.length} 个附件`);
     }
-    console.log(`✅ [Release Sync] Releases 同步完成。`);
+
+    if (createdCount === 0) {
+      console.log(`⏩ [Release Sync] 全部 ${upstreamReleases.length} 个 Release 均已同步，无需变更。`);
+    } else {
+      console.log(`✅ [Release Sync] 本次新建 ${createdCount} 个 Release，跳过 ${skippedCount} 个已同步项。`);
+    }
   } catch (err) {
     console.warn(`⚠️ [Release Sync] Release 同步出现异常: ${err.message}`);
     logDetail('WARN', `[Release] 同步异常: ${err.message}`);
@@ -592,6 +746,9 @@ async function saveDetailedLogsToPrivateConfig(failCount) {
 }
 
 async function main() {
+  // 先完成凭据解析，后续所有 API 调用均依赖由此构建的 client
+  await initAuth();
+
   const configs = await fetchConfig();
   console.log(`📦 [Task Start] 组织: ${ORG_NAME}, 共有 ${configs.length} 个备份目标待处理`);
   logDetail('START', `组织: ${ORG_NAME}, 待处理任务数: ${configs.length}`);

@@ -25,6 +25,12 @@ jobs:
 
       - name: Execute Sync
         env:
+          # 优先使用 GitHub App 身份：发布的 Release 归属 owwk-backup-bot[bot]，不落入个人账号
+          # 命名用 VAULT_APP_ 前缀：GitHub 禁止 Secret / Variable 以 GITHUB_ 开头
+          VAULT_APP_ID: ${{ vars.VAULT_APP_ID }}
+          VAULT_APP_INSTALLATION_ID: ${{ vars.VAULT_APP_INSTALLATION_ID }}
+          VAULT_APP_PRIVATE_KEY: ${{ secrets.VAULT_APP_PRIVATE_KEY }}
+          # 仅在 App 凭据缺失时回退使用
           ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: node sync.mjs
