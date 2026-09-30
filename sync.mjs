@@ -61,10 +61,11 @@ async function initAuth() {
   const installationId = process.env.VAULT_APP_INSTALLATION_ID;
 
   if (appId && rawKey && installationId) {
-    console.log('🔑 [Auth] 检测到 GitHub App 凭据，正在签发 Installation Token...');
+    publicLog('🔑 [Auth] 凭据已就绪，正在签发访问令牌...');
     try {
       PAT = await getAppInstallationToken(appId, normalizePrivateKey(rawKey), installationId);
-      console.log(`✅ [Auth] 已启用 GitHub App 身份 (App ID: ${appId})，发布行为不再归属个人账号。`);
+      // 安全红线：App ID / Installation ID 属敏感标识，不得出现在公开日志中
+      logDetail('INFO', `GitHub App 身份认证成功 (App ID: ${appId}, Installation ID: ${installationId})`);
     } catch (err) {
       const detail = err.response
         ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}`
@@ -74,7 +75,8 @@ async function initAuth() {
   } else {
     PAT = process.env.ORG_ADMIN_PAT || process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
     if (PAT) {
-      console.log('⚠️ [Auth] 未检测到完整 App 凭据，回退使用 PAT（发布行为将归属该令牌所有者）。');
+      publicLog('⚠️ [Auth] 已回退至令牌认证模式。');
+      logDetail('WARN', '未检测到完整 App 凭据，回退使用 PAT（发布行为将归属该令牌所有者）');
     }
   }
 
@@ -104,41 +106,91 @@ const crateClient = axios.create({
 
 // 内存日志收集器（用于回写私有仓保存完整明细）
 const detailedLogs = [];
+// 明细日志仍可能携带令牌（如 remote URL 内的 x-access-token），落盘前统一抹除
+function redact(text) {
+  let out = String(text);
+  if (PAT) out = out.split(PAT).join('***');
+  out = out.replace(/x-access-token:[^@\s"]+/gi, 'x-access-token:***');
+  out = out.replace(/gh[opsu]_[A-Za-z0-9]{20,}/g, '***');
+  return out;
+}
 function logDetail(level, msg) {
   const time = new Date().toISOString();
-  const line = `[${time}] [${level}] ${msg}`;
+  const line = `[${time}] [${level}] ${redact(msg)}`;
   detailedLogs.push(line);
 }
 
-// GitHub Actions 原生日志脱敏机制
-function mask(val) {
-  if (val && typeof val === 'string' && val.trim().length > 2) {
-    console.log(`::add-mask::${val.trim()}`);
+// 公开控制台捕获原始写入器：本仓库为 Public，Action 日志对外完全可见，
+// 故除通用状态行外，任何业务明细一律不得落到公开控制台，只写私有明细日志。
+const rawConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console)
+};
+
+// 唯一允许公开输出的通道：只放与备份目标、上游、版本无关的通用状态行
+function publicLog(msg) {
+  rawConsole.log(msg);
+}
+
+// 安装输出闸门：接管所有 console 输出并转入私有明细日志。
+// 放行 ::add-mask:: 一类 Actions 工作流指令，避免脱敏与注释机制失效。
+function installOutputGuard() {
+  const LEVEL = { log: 'INFO', info: 'INFO', debug: 'DEBUG', warn: 'WARN', error: 'ERROR' };
+  for (const name of Object.keys(LEVEL)) {
+    console[name] = (...args) => {
+      const text = args
+        .map(a => (typeof a === 'string' ? a : a instanceof Error ? a.message : String(a)))
+        .join(' ');
+      if (/^\s*::/.test(text)) return rawConsole[name](text);
+      logDetail(LEVEL[name], text);
+    };
   }
 }
 
-function run(cmd, cwd = process.cwd()) {
-  return execSync(cmd, { cwd, stdio: 'inherit' });
+// 汇总子进程失败明细（stdout + stderr），仅用于写入私有日志
+function describeProcFailure(error, cmd) {
+  const parts = [];
+  if (error.stdout) parts.push(error.stdout.toString().trim());
+  if (error.stderr) parts.push(error.stderr.toString().trim());
+  const out = parts.filter(Boolean).join('\n');
+  return out ? `${cmd}\n${out}` : cmd;
 }
 
-function runSilent(cmd, cwd = process.cwd()) {
+// 子进程统一使用 pipe：命令原文与 git 回显（上游 owner、分支名、tag 名、commit SHA）
+// 全部只进私有明细日志，杜绝经 stdio inherit 直通公开控制台
+function run(cmd, cwd = process.cwd()) {
+  try {
+    const out = execSync(cmd, { cwd, stdio: 'pipe' });
+    const text = out ? out.toString().trim() : '';
+    if (text) logDetail('EXEC', `${cmd}\n${text}`);
+  } catch (error) {
+    logDetail('ERROR', describeProcFailure(error, cmd));
+    throw new Error('子进程执行失败，明细见私有配置仓 logs/latest.log');
+  }
+}
+
+// expectedFailure: true 用于「失败即正常」的探测类命令（如分支存在性判定），
+// 这类失败不写入错误日志，避免污染私有日志的可读性
+function runSilent(cmd, cwd = process.cwd(), opts = {}) {
   try {
     return execSync(cmd, { cwd, stdio: 'pipe' }).toString().trim();
   } catch (error) {
-    const stderr = error.stderr ? error.stderr.toString() : error.message;
-    throw new Error(`Command failed: ${cmd}\n${stderr}`);
+    if (!opts.expectedFailure) {
+      logDetail('ERROR', describeProcFailure(error, cmd));
+    }
+    throw new Error('子进程执行失败，明细见私有配置仓 logs/latest.log');
   }
 }
 
 // 动态从私有配置仓库拉取 repos.json
 async function fetchConfig() {
   logDetail('INFO', `从私有配置仓 ${CONFIG_REPO} 读取 repos.json...`);
-  console.log(`🔐 [Config Loader] 正在从私有配置仓 [${CONFIG_REPO}] 安全读取配置清单...`);
+  publicLog('🔐 [Config Loader] 正在安全读取备份配置清单...');
   try {
     const res = await client.get(`/repos/${ORG_NAME}/${CONFIG_REPO}/contents/repos.json`);
     const rawContent = Buffer.from(res.data.content, 'base64').toString('utf-8');
     const configs = JSON.parse(rawContent);
-    console.log(`✅ [Config Loader] 成功加载 ${configs.length} 项配置（已从私有仓载入内存）。`);
     logDetail('INFO', `成功加载 ${configs.length} 项配置`);
     return configs;
   } catch (err) {
@@ -182,7 +234,7 @@ async function fetchUpstreamDescription(item) {
       }
     }
   } catch (err) {
-    console.log(`⚠️ [Repo Meta] 无法拉取上游 About 简介 (${err.message})，将使用留空`);
+    logDetail('WARN', `上游 About 简介拉取失败（将留空），原因: ${err.message}`);
   }
 
   return '';
@@ -197,24 +249,20 @@ async function ensureRepo(item) {
 
   try {
     const res = await client.get(`/repos/${ORG_NAME}/${repoName}`);
-    console.log(`✅ [Repo Ready] 目标仓库已就绪。`);
     logDetail('INFO', `仓库 ${ORG_NAME}/${repoName} 已就绪。Homepage: ${homepage}`);
 
     const currentDesc = res.data.description || '';
     const currentHomepage = res.data.homepage || '';
 
     if (currentDesc !== description || currentHomepage !== homepage) {
-      console.log(`📝 [Repo Meta] 正在同步仓库元数据（About 原文与 Homepage）...`);
       await client.patch(`/repos/${ORG_NAME}/${repoName}`, {
         description,
         homepage
       });
-      console.log(`✅ [Repo Meta] 元数据更新完成。`);
       logDetail('INFO', `仓库 ${repoName} 元数据已更新至最新。Description: "${description}"`);
     }
   } catch (err) {
     if (err.response?.status === 404) {
-      console.log(`🚀 [Repo Init] 目标仓库不存在，正在自动创建独立仓库 (Private: ${isPrivate})...`);
       logDetail('INFO', `正在创建独立仓库 ${ORG_NAME}/${repoName}...`);
       await client.post(`/orgs/${ORG_NAME}/repos`, {
         name: repoName,
@@ -222,7 +270,6 @@ async function ensureRepo(item) {
         description,
         homepage
       });
-      console.log(`✅ [Repo Created] 独立仓库创建成功。`);
       logDetail('INFO', `独立仓库 ${ORG_NAME}/${repoName} 创建成功。Description: "${description}"`);
     } else {
       logDetail('ERROR', `检查/创建仓库失败: ${err.message}`);
@@ -287,7 +334,6 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
   const gh = parseGitHubRepo(upstream);
   if (!gh) return;
 
-  console.log(`📦 [Release Sync] 检测到上游为 GitHub 仓库 (${gh.owner}/${gh.repo})，开始同步 Releases 与附件...`);
   logDetail('INFO', `[Release] 开始检查 Releases: ${gh.owner}/${gh.repo} -> ${targetRepo}`);
 
   try {
@@ -305,7 +351,7 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
     }
 
     if (!upstreamReleases.length) {
-      console.log(`ℹ️ [Release Sync] 上游没有发布过任何 Release，跳过。`);
+      logDetail('INFO', `[Release] 上游仓库无公开 releases，跳过`);
       return;
     }
 
@@ -329,6 +375,7 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
 
     let createdCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
 
     for (const rel of ordered) {
       const sameTag = targetByTag.get(rel.tag_name) || [];
@@ -342,7 +389,6 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
       }
 
       if (sameTag.length > 1) {
-        console.warn(`  ⚠️ [Duplicate] 目标仓 tag [${rel.tag_name}] 存在 ${sameTag.length} 个 Release 对象，将只按最新上游版本推进。`);
         logDetail('WARN', `[Release] tag ${rel.tag_name} 在目标仓存在 ${sameTag.length} 个重复对象`);
       }
 
@@ -355,23 +401,24 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
           await client.patch(`/repos/${ORG_NAME}/${targetRepo}/releases/${old.id}`, {
             name: `${oldName}${SUPERSEDED_SUFFIX}`
           });
-          console.log(`  🗂️ [Superseded] 已将旧 Release [${rel.tag_name}] 标记为被取代（原内容与资产保留）。`);
           logDetail('INFO', `[Release] 旧 Release ${rel.tag_name} (id=${old.id}) 已标记为被上游重新发布取代`);
         } catch (markErr) {
-          console.warn(`  ⚠️ 标记旧 Release [${rel.tag_name}] 失败: ${markErr.message}`);
           logDetail('WARN', `[Release] 标记旧 Release ${rel.tag_name} 失败: ${markErr.message}`);
         }
       }
 
-      console.log(`  ➕ 正在同步 Release [${rel.tag_name}] (${rel.name || rel.tag_name})...`);
       logDetail('INFO', `[Release] 开始同步 ${rel.tag_name}`);
+      failedCount++;
 
       // 在目标仓创建对应的 Release（body 开头写入原始发布元信息）
+      // 关键：绝不透传上游 target_commitish。实测判定（复现见 logs 归档）：
+      // 该字段只接受目标仓可达的分支名；传入上游 commit SHA 或 tag 名在 GitHub 会直接 422，
+      // 且目标仓已存在该 tag 时即使传 'main' 也可能被判非法。故统一省略，由 GitHub 按
+      // 目标仓现存 ref 解析，tag 不存在时自动基于默认分支创建，从根本上消除 422。
       let createdRelease;
       try {
         const createRes = await client.post(`/repos/${ORG_NAME}/${targetRepo}/releases`, {
           tag_name: rel.tag_name,
-          target_commitish: rel.target_commitish || 'main',
           name: rel.name || rel.tag_name,
           body: composeBody(gh.owner, gh.repo, rel),
           draft: false,
@@ -379,25 +426,23 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
         });
         createdRelease = createRes.data;
         createdCount++;
+        failedCount--;
       } catch (err) {
-        console.warn(`  ⚠️ 创建 Release [${rel.tag_name}] 失败: ${err.message}`);
-        logDetail('WARN', `[Release] 创建 ${rel.tag_name} 失败: ${err.message}`);
+        const detail = err.response?.data ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}` : err.message;
+        logDetail('WARN', `[Release] 创建 ${rel.tag_name} 失败: ${detail}`);
         continue;
       }
 
       // 同步附件 Assets
       const assets = rel.assets || [];
       if (assets.length > 0) {
-        console.log(`    📎 包含 ${assets.length} 个附件，开始转存...`);
         for (const asset of assets) {
           try {
-            console.log(`      ⬇️ 下载附件: ${asset.name} (${(asset.size / 1024 / 1024).toFixed(2)} MB)...`);
             const downloadRes = await axios.get(asset.browser_download_url, {
               responseType: 'arraybuffer',
               headers: { 'User-Agent': 'VaultSyncBot' }
             });
 
-            console.log(`      ⬆️ 上传至备份仓: ${asset.name}...`);
             const uploadUrl = createdRelease.upload_url.split('{')[0] + `?name=${encodeURIComponent(asset.name)}`;
             await axios.post(uploadUrl, downloadRes.data, {
               headers: {
@@ -408,9 +453,8 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
               maxBodyLength: Infinity,
               maxContentLength: Infinity
             });
-            console.log(`      ✅ 附件转存成功: ${asset.name}`);
+            logDetail('INFO', `[Release] 附件转存成功: ${asset.name} (${(asset.size / 1024 / 1024).toFixed(2)} MB)`);
           } catch (assetErr) {
-            console.warn(`      ⚠️ 转存附件 [${asset.name}] 失败: ${assetErr.message}`);
             logDetail('WARN', `[Release] 转存附件 ${asset.name} 失败: ${assetErr.message}`);
           }
         }
@@ -418,13 +462,12 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
       logDetail('INFO', `[Release] 成功同步 ${rel.tag_name} 及 ${assets.length} 个附件`);
     }
 
-    if (createdCount === 0) {
-      console.log(`⏩ [Release Sync] 全部 ${upstreamReleases.length} 个 Release 均已同步，无需变更。`);
-    } else {
-      console.log(`✅ [Release Sync] 本次新建 ${createdCount} 个 Release，跳过 ${skippedCount} 个已同步项。`);
-    }
+    // 统计必须如实反映结果：此前「全部同步完成」会在 22 项全部失败时误报为无需变更
+    logDetail(
+      'INFO',
+      `[Release] 上游共 ${upstreamReleases.length} 个 Release：新建 ${createdCount}，已同步跳过 ${skippedCount}，失败 ${failedCount}`
+    );
   } catch (err) {
-    console.warn(`⚠️ [Release Sync] Release 同步出现异常: ${err.message}`);
     logDetail('WARN', `[Release] 同步异常: ${err.message}`);
   }
 }
@@ -432,7 +475,6 @@ async function syncReleasesIfGitHub(upstream, targetRepo) {
 // 模式 1：同步 Git 仓库全量镜像（防跑路 + 分叉自动归档保护模型）
 async function syncGit(upstream, targetRepo, item = {}) {
   const targetUrl = `https://x-access-token:${PAT}@github.com/${ORG_NAME}/${targetRepo}.git`;
-  console.log(`🔄 [Git Mirror] 正在执行镜像增量克隆与安全推送 (防跑路 Append-Only + 分叉自动归档模式)...`);
   logDetail('INFO', `[Git] 开始同步 ${upstream} -> ${ORG_NAME}/${targetRepo}`);
 
   const tempDir = path.join(__dirname, `temp_${targetRepo}.git`);
@@ -480,7 +522,7 @@ async function syncGit(upstream, targetRepo, item = {}) {
           // 检查上游裸仓是否存在同名分支
           let upstreamHasBranch = false;
           try {
-            runSilent(`git rev-parse --verify "refs/heads/${branch}"`, tempDir);
+            runSilent(`git rev-parse --verify "refs/heads/${branch}"`, tempDir, { expectedFailure: true });
             upstreamHasBranch = true;
           } catch {
             upstreamHasBranch = false;
@@ -490,7 +532,7 @@ async function syncGit(upstream, targetRepo, item = {}) {
             // 判定：备份仓的 commit 是否为上游当前分支 commit 的直系祖先 (Fast-Forward 判定)
             let isFastForward = false;
             try {
-              runSilent(`git merge-base --is-ancestor "refs/backup-heads/${branch}" "refs/heads/${branch}"`, tempDir);
+              runSilent(`git merge-base --is-ancestor "refs/backup-heads/${branch}" "refs/heads/${branch}"`, tempDir, { expectedFailure: true });
               isFastForward = true;
             } catch {
               isFastForward = false;
@@ -500,21 +542,16 @@ async function syncGit(upstream, targetRepo, item = {}) {
               // 🚨 捕获分叉：上游发生了 Force Push / 偷删 Commit / 历史重写！
               const nowStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
               const archiveBranch = `archive/${branch}-diverged-${nowStr}`;
-              console.log(`⚠️ [Anti-ForcePush] 检测到分支 [${branch}] 历史分叉 (上游发生了 Force Push 或删减 Commit)！`);
-              console.log(`🛡️ [Anti-ForcePush] 正在将备份仓原提交历史永久封存至分支 [${archiveBranch}]...`);
-              logDetail('WARN', `分支 [${branch}] 发生 Force Push / 篡改历史，已自动将备份仓原历史归档至 [${archiveBranch}]`);
+              logDetail('WARN', `[Anti-ForcePush] 分支 [${branch}] 历史分叉 (上游 Force Push 或删减 Commit)，原历史归档至 [${archiveBranch}]`);
 
               // 将备份仓原分支指针推送到归档分支进行封存
               runSilent(`git push backup "refs/backup-heads/${branch}:refs/heads/${archiveBranch}"`, tempDir);
-              console.log(`✅ [Anti-ForcePush] 分支 [${branch}] 原历史归档封存成功。`);
             }
           } else {
-            console.log(`ℹ️ [Branch Preserved] 上游已移除分支 [${branch}]，根据 Append-Only 策略，备份仓继续永久保留。`);
             logDetail('INFO', `上游已移除分支 [${branch}]，备份仓予以保留`);
           }
         }
       } catch (checkErr) {
-        console.warn(`⚠️ [Divergence Check Warning] 分叉检测出现警告: ${checkErr.message}，将继续推进安全同步。`);
         logDetail('WARN', `分叉检测警告: ${checkErr.message}`);
       }
     }
@@ -525,7 +562,6 @@ async function syncGit(upstream, targetRepo, item = {}) {
     // - 标签 refs/tags/*:refs/tags/* 正常快进追加推送（防恶意覆写 Tag）
     run(`git push backup "+refs/heads/*:refs/heads/*" "refs/tags/*:refs/tags/*"`, tempDir);
 
-    console.log(`✅ [Git Mirror] 镜像同步完成。`);
     logDetail('INFO', `[Git] 同步完成: ${targetRepo}`);
   } finally {
     await fs.remove(tempDir);
@@ -540,15 +576,14 @@ async function syncGit(upstream, targetRepo, item = {}) {
 
 // 模式 2：全量历史版本链式重放与增量同步（复原完整版本迭代演进与原作者/时间戳）
 async function getAllCrateVersions(crateName) {
-  console.log(`🔎 [Crate API] 正在拉取 ${crateName} 的历史版本元数据...`);
+  logDetail('INFO', `[Crate] 正在拉取 ${crateName} 的历史版本元数据...`);
   const response = await crateClient.get(`https://crates.io/api/v1/crates/${crateName}/versions`);
   const versions = response.data?.versions || [];
   if (!versions.length) throw new Error(`未在 crates.io 找到 ${crateName} 的有效版本`);
 
   // 按时间正序排序（从最早版本到最新版本）
   versions.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-  console.log(`📦 [Crate Versions] 成功解析 ${versions.length} 个版本 (最早: v${versions[0].num} @ ${versions[0].created_at.slice(0, 10)}, 最新: v${versions[versions.length - 1].num} @ ${versions[versions.length - 1].created_at.slice(0, 10)})`);
-  logDetail('INFO', `[Crate] ${crateName} 获取到 ${versions.length} 个历史版本`);
+  logDetail('INFO', `[Crate] ${crateName} 获取到 ${versions.length} 个历史版本 (最早: v${versions[0].num}, 最新: v${versions[versions.length - 1].num})`);
   return versions;
 }
 
@@ -623,7 +658,6 @@ async function syncCrate(item) {
   const crateName = item.crate_name;
   const targetRepo = item.target_repo || crateName;
 
-  console.log(`🔄 [Crate Sync] 启动 Crate 专属全量版本与作者历史同步流...`);
   logDetail('INFO', `开始处理 Crate: ${crateName} -> 目标仓: ${targetRepo}`);
 
   const workDir = path.join(__dirname, 'work', crateName);
@@ -661,26 +695,22 @@ async function syncCrate(item) {
     // 增量模式：检查未同步的新版本
     const pendingVersions = versions.filter(v => !existingTags.includes(`v${v.num}`));
     if (pendingVersions.length === 0) {
-      console.log(`⏩ [Crate Skipped] ${crateName} 全量 ${versions.length} 个版本历史已就绪，跳过。`);
       logDetail('INFO', `[Crate] ${crateName} 全量版本已最新 (最新: v${latestVer.num})，跳过`);
       await fs.remove(workDir);
       return;
     }
 
-    console.log(`📦 [Crate Incremental] 检测到 ${pendingVersions.length} 个新版本待追加同步...`);
+    logDetail('INFO', `[Crate] ${crateName} 检测到 ${pendingVersions.length} 个新版本待追加同步`);
     for (const ver of pendingVersions) {
-      console.log(`  ➕ 追加同步 v${ver.num} (${ver.created_at.slice(0, 10)})...`);
+      logDetail('INFO', `[Crate] 追加同步 v${ver.num} (${ver.created_at.slice(0, 10)})`);
       await downloadAndExtractCrate(crateName, ver.num, targetRepoPath, workDir);
       commitAndTagCrate(targetRepoPath, crateName, ver);
     }
 
-    console.log(`🚀 [Crate Push] 正在推送增量版本至 main...`);
     runSilent(`git push origin main --tags`, targetRepoPath);
-    console.log(`✅ [Crate Synced] ${crateName} 增量同步完成。`);
     logDetail('INFO', `[Crate] ${crateName} 追加同步了 ${pendingVersions.length} 个新版本`);
   } else {
     // 全量历史重构模式：从最早版本重建完整链条并还原作者
-    console.log(`🏗️ [Crate Rebuild] 目标仓尚未构建完整版本演进史，开始从 v${versions[0].num} 链式重构全部 ${versions.length} 个版本...`);
     logDetail('INFO', `[Crate] ${crateName} 开始全量链式重放 ${versions.length} 个版本历史`);
 
     // 重置为一个全新的本地 Git 仓库
@@ -692,14 +722,12 @@ async function syncCrate(item) {
       const ver = versions[idx];
       const author = ver.published_by?.login || 'crates';
       const progress = `[${idx + 1}/${versions.length}]`;
-      console.log(`  📦 ${progress} 重放 v${ver.num} | 发布者: ${author} | 日期: ${ver.created_at.slice(0, 10)}`);
+      logDetail('INFO', `[Crate] ${progress} 重放 v${ver.num} | 发布者: ${author} | 日期: ${ver.created_at.slice(0, 10)}`);
       await downloadAndExtractCrate(crateName, ver.num, targetRepoPath, workDir);
       commitAndTagCrate(targetRepoPath, crateName, ver);
     }
 
-    console.log(`🚀 [Crate Push] 历史链式构建完成，正在推送 main 分支与所有 ${versions.length} 个 Release Tags...`);
     runSilent(`git push -f origin main --tags`, targetRepoPath);
-    console.log(`✅ [Crate Synced] ${crateName} 全量历史重构完成！`);
     logDetail('INFO', `[Crate] ${crateName} 全量 ${versions.length} 个版本历史重构完成并推送`);
   }
 
@@ -724,7 +752,6 @@ async function writeLogFile(filePath, content, message) {
 }
 
 async function saveDetailedLogsToPrivateConfig(failCount) {
-  console.log(`\n📝 [Audit] 正在将全量明文运行日志回写至私有仓库 [${CONFIG_REPO}]...`);
   const statusSummary = failCount > 0 ? `FAILED (${failCount} errors)` : 'SUCCESS';
   logDetail('SUMMARY', `任务执行完毕，最终状态: ${statusSummary}`);
 
@@ -739,35 +766,28 @@ async function saveDetailedLogsToPrivateConfig(failCount) {
     // 2. 写入历史归档文件 logs/history/YYYY-MM-DD_HH-mm-ss.log
     await writeLogFile(`logs/history/${dateStr}.log`, logText, `chore: archive sync log ${dateStr}`);
     
-    console.log(`✅ [Audit] 明细日志回写成功！已在私有仓库 config/logs/ 下更新 latest.log 并完成历史归档。`);
+    publicLog('🗂️ [Audit] 运行明细已归档至私有审计仓。');
   } catch (err) {
-    console.error(`⚠️ [Audit Warning] 日志回写私有仓失败: ${err.message}`);
+    publicLog(`⚠️ [Audit] 运行明细归档失败：${err.message}`);
   }
 }
 
 async function main() {
+  // 关键安全：接管全部 console 输出，公开控制台自此只允许 publicLog 输出通用状态行
+  installOutputGuard();
+
   // 先完成凭据解析，后续所有 API 调用均依赖由此构建的 client
   await initAuth();
 
   const configs = await fetchConfig();
-  console.log(`📦 [Task Start] 组织: ${ORG_NAME}, 共有 ${configs.length} 个备份目标待处理`);
+  publicLog('📦 [Task Start] 备份同步已启动。');
   logDetail('START', `组织: ${ORG_NAME}, 待处理任务数: ${configs.length}`);
-
-  // 关键安全：精准日志掩码注入
-  for (const item of configs) {
-    mask(item.target_repo);
-    mask(item.upstream);
-    mask(item.crate_name);
-    mask(item.homepage);
-  }
 
   let failCount = 0;
 
   for (let i = 0; i < configs.length; i++) {
     const item = configs[i];
-    console.log(`\n==============================================`);
-    console.log(`执行任务 [${i + 1}/${configs.length}]: 类型 [${item.type}] 目标 [${item.target_repo}]`);
-    console.log(`==============================================`);
+    // 关键安全：公开控制台每日志行都不得携带目标名、类型与序号等可推断清单结构的信息
     logDetail('TASK', `[${i + 1}/${configs.length}] ${item.type} -> ${item.target_repo || item.crate_name}`);
 
     try {
@@ -778,29 +798,28 @@ async function main() {
       } else if (item.type === 'crate') {
         await syncCrate(item);
       } else {
-        console.warn(`⚠️ [Unknown Type] 未知类型: ${item.type}`);
         logDetail('WARN', `未知类型: ${item.type}`);
       }
     } catch (err) {
       failCount++;
-      console.error(`❌ [Task Error] 任务执行失败: ${err.message}`);
       logDetail('ERROR', `任务失败: ${item.target_repo || item.crate_name}, 原因: ${err.message}`);
     }
   }
 
-  console.log(`\n==============================================`);
   // 回写私有仓日志
   await saveDetailedLogsToPrivateConfig(failCount);
 
   if (failCount > 0) {
-    console.error(`⚠️ 执行完毕，其中有 ${failCount} 个任务失败。`);
+    publicLog(`⚠️ 同步检查完成，存在 ${failCount} 个失败任务。`);
     process.exit(1);
   } else {
-    console.log(`🎉 全部备份目标同步检查完成！`);
+    publicLog('🎉 全部备份目标同步检查完成。');
   }
 }
 
 main().catch(err => {
-  console.error('❌ [Fatal Error]', err.message);
+  // 致命错误只回写私有日志，公开控制台不暴露任何上下文
+  logDetail('ERROR', `[Fatal Error] ${err.message}`);
+  publicLog('❌ 同步流程异常终止，详见私有审计仓。');
   process.exit(1);
 });

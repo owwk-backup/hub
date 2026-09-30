@@ -25,10 +25,12 @@ jobs:
 
       - name: Execute Sync
         env:
-          # 优先使用 GitHub App 身份：发布的 Release 归属 owwk-backup-bot[bot]，不落入个人账号
-          # 命名用 VAULT_APP_ 前缀：GitHub 禁止 Secret / Variable 以 GITHUB_ 开头
-          VAULT_APP_ID: ${{ vars.VAULT_APP_ID }}
-          VAULT_APP_INSTALLATION_ID: ${{ vars.VAULT_APP_INSTALLATION_ID }}
+          # 所有凭据（含 App ID / Installation ID）一律以 Secret 注入：
+          # Actions 会在运行日志的 env 区块对 Secret 统一显示为 ***，
+          # 而 Variables 会被明文回显，等于把 App 标识直接暴露在公开日志里。
+          # 命名用 VAULT_APP_ 前缀：GitHub 禁止 Secret 以 GITHUB_ 开头
+          VAULT_APP_ID: ${{ secrets.VAULT_APP_ID }}
+          VAULT_APP_INSTALLATION_ID: ${{ secrets.VAULT_APP_INSTALLATION_ID }}
           VAULT_APP_PRIVATE_KEY: ${{ secrets.VAULT_APP_PRIVATE_KEY }}
           # 仅在 App 凭据缺失时回退使用
           ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
