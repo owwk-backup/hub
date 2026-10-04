@@ -2,7 +2,7 @@ name: Global Org Sync Hub
 
 on:
   schedule:
-    - cron: '27 3 * * *' # 每天 UTC 03:27 (北京时间 11:27) 自动同步
+    - cron: '27 * * * *' # 每天 UTC 03:27 (北京时间 11:27) 自动同步
   workflow_dispatch:    # 支持在 Actions 界面一键手动触发
 
 jobs:
