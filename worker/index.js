@@ -320,20 +320,20 @@ function parsePageInfo(urlStr) {
   return null;
 }
 
-// 统一凭据解析器：优先使用 GitHub App，回退使用个人 PAT
+// 统一凭据解析器：强制仅使用 GitHub App 凭据，严禁向任何个人 Token 降级
 async function getGitHubHeaders(env) {
-  let token = env.GITHUB_PAT;
-
-  if (env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY && env.GITHUB_APP_INSTALLATION_ID) {
-    token = await getAppInstallationToken(
-      env.GITHUB_APP_ID,
-      env.GITHUB_APP_PRIVATE_KEY,
-      env.GITHUB_APP_INSTALLATION_ID
-    );
+  if (!env.GITHUB_APP_ID || !env.GITHUB_APP_PRIVATE_KEY || !env.GITHUB_APP_INSTALLATION_ID) {
+    throw new Error('未配置完整的 GitHub App 凭据 (GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, GITHUB_APP_INSTALLATION_ID)');
   }
 
+  const token = await getAppInstallationToken(
+    env.GITHUB_APP_ID,
+    env.GITHUB_APP_PRIVATE_KEY,
+    env.GITHUB_APP_INSTALLATION_ID
+  );
+
   if (!token) {
-    throw new Error('未配置有效的 GitHub App 凭据或 GITHUB_PAT');
+    throw new Error('获取 GitHub App Installation Token 失败或返回为空');
   }
 
   return {
