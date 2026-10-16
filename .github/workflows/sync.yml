@@ -1,0 +1,46 @@
+name: Global Org Sync Hub
+
+on:
+  # 定时触发全权交由 Cloudflare Worker Cron Trigger 进行秒级精准调度与动态维护
+  workflow_dispatch:    # 支持在 Actions 界面或由 Cloudflare Worker API 远程触发
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 允许提交保活 commit
+    steps:
+      - name: Checkout Hub
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Execute Sync
+        env:
+          # 所有凭据（含 App ID / Installation ID）一律以 Secret 注入：
+          # Actions 会在运行日志的 env 区块对 Secret 统一显示为 ***，
+          # 而 Variables 会被明文回显，等于把 App 标识直接暴露在公开日志里。
+          # 命名用 VAULT_APP_ 前缀：GitHub 禁止 Secret 以 GITHUB_ 开头
+          VAULT_APP_ID: ${{ secrets.VAULT_APP_ID }}
+          VAULT_APP_INSTALLATION_ID: ${{ secrets.VAULT_APP_INSTALLATION_ID }}
+          VAULT_APP_PRIVATE_KEY: ${{ secrets.VAULT_APP_PRIVATE_KEY }}
+          # 仅在 App 凭据缺失时回退使用
+          ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: node sync.mjs
+
+      - name: Keepalive Workflow
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          date -u > keepalive.log
+          git add -f keepalive.log
+          git commit -m "chore: automated keepalive [skip ci]" || exit 0
+          git push

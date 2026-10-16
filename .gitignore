@@ -1,0 +1,13 @@
+node_modules/
+temp_*.git/
+work/
+*.log
+!keepalive.log
+.env
+.DS_Store
+agents.md
+wrangler.toml
+**/wrangler.toml
+.dev.vars
+**/.dev.vars
+.wrangler/
