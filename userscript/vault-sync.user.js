@@ -255,7 +255,9 @@
                     return {
                         type: 'git',
                         target_repo: parts[1],
-                        fullName: `${parts[0]}/${parts[1]}`
+                        fullName: `${parts[0]}/${parts[1]}`,
+                        owner: parts[0],
+                        url: `https://github.com/${parts[0]}/${parts[1]}`
                     };
                 }
             } else if (u.hostname.includes('codeberg.org')) {
@@ -264,7 +266,9 @@
                     return {
                         type: 'git',
                         target_repo: parts[1],
-                        fullName: `${parts[0]}/${parts[1]}`
+                        fullName: `${parts[0]}/${parts[1]}`,
+                        owner: parts[0],
+                        url: `https://codeberg.org/${parts[0]}/${parts[1]}`
                     };
                 }
             } else if (u.hostname.includes('crates.io')) {
@@ -273,7 +277,8 @@
                     return {
                         type: 'crate',
                         target_repo: parts[1],
-                        crate_name: parts[1]
+                        crate_name: parts[1],
+                        url: `https://crates.io/crates/${parts[1]}`
                     };
                 }
             }
@@ -352,24 +357,111 @@
         }
     }
 
-    function isTargetBacked(targetName) {
-        if (!targetName) return false;
+    function cleanSourceUrl(url) {
+        if (!url) return '';
+        try {
+            const u = new URL(url);
+            return `${u.hostname}${u.pathname.replace(/\.git$/, '').replace(/\/$/, '')}`.toLowerCase();
+        } catch {
+            return String(url).replace(/\.git$/, '').replace(/\/$/, '').toLowerCase();
+        }
+    }
+
+    function findBackedItem(target) {
+        if (!target) return null;
         const list = getCachedRepos();
-        return list.some(item => (item.target_repo || item.crate_name || item) === targetName);
+        if (!Array.isArray(list)) return null;
+
+        if (typeof target === 'string') {
+            const lower = target.toLowerCase();
+            return list.find(item => {
+                const name = (item.target_repo || item.crate_name || item).toLowerCase();
+                return name === lower;
+            }) || null;
+        }
+
+        if (target.type === 'crate') {
+            const crateName = (target.crate_name || target.target_repo || '').toLowerCase();
+            return list.find(item => {
+                if (item.type === 'crate') {
+                    return (item.crate_name || item.target_repo || '').toLowerCase() === crateName;
+                }
+                return false;
+            }) || null;
+        }
+
+        // Git: 优先通过规范化 URL 严格匹配来源地址
+        const targetUrl = cleanSourceUrl(target.url || (target.fullName ? `https://${location.hostname}/${target.fullName}` : ''));
+        if (targetUrl) {
+            const matched = list.find(item => {
+                const itemUrl = cleanSourceUrl(item.upstream || item.homepage);
+                return itemUrl && itemUrl === targetUrl;
+            });
+            if (matched) return matched;
+        }
+
+        // 兜底：比对 target_repo 或 owner.repo 格式
+        const scopedName = target.fullName ? target.fullName.replace('/', '.') : '';
+        return list.find(item => {
+            const tr = (item.target_repo || '').toLowerCase();
+            return tr === (target.target_repo || '').toLowerCase() || (scopedName && tr === scopedName.toLowerCase());
+        }) || null;
+    }
+
+    function isTargetBacked(target) {
+        return Boolean(findBackedItem(target));
     }
 
     function addTargetToCache(targetObj) {
         const list = getCachedRepos();
-        const name = targetObj.target_repo || targetObj.crate_name;
-        if (!list.some(item => (item.target_repo || item.crate_name || item) === name)) {
+        const name = (targetObj.target_repo || targetObj.crate_name || '').toLowerCase();
+        const targetUrl = cleanSourceUrl(targetObj.upstream || targetObj.homepage);
+
+        const existsIndex = list.findIndex(item => {
+            if (targetUrl) {
+                const itemUrl = cleanSourceUrl(item.upstream || item.homepage);
+                if (itemUrl && itemUrl === targetUrl) return true;
+            }
+            return (item.target_repo || item.crate_name || '').toLowerCase() === name;
+        });
+
+        if (existsIndex !== -1) {
+            list[existsIndex] = { ...list[existsIndex], ...targetObj };
+        } else {
             list.push(targetObj);
+        }
+        setCachedRepos(list);
+    }
+
+    function updateRepoInCache(oldTargetRepo, newTargetRepo) {
+        const list = getCachedRepos();
+        const item = list.find(x => (x.target_repo || '').toLowerCase() === oldTargetRepo.toLowerCase());
+        if (item) {
+            item.target_repo = newTargetRepo;
             setCachedRepos(list);
         }
     }
 
-    function removeTargetFromCache(targetName) {
+    function removeTargetFromCache(targetIdentifier) {
         let list = getCachedRepos();
-        list = list.filter(item => (item.target_repo || item.crate_name || item) !== targetName);
+        if (typeof targetIdentifier === 'string') {
+            const lower = targetIdentifier.toLowerCase();
+            list = list.filter(item => {
+                const name = (item.target_repo || item.crate_name || item).toLowerCase();
+                return name !== lower;
+            });
+        } else if (targetIdentifier && typeof targetIdentifier === 'object') {
+            const targetUrl = cleanSourceUrl(targetIdentifier.url || targetIdentifier.upstream || targetIdentifier.homepage);
+            const name = (targetIdentifier.target_repo || targetIdentifier.crate_name || '').toLowerCase();
+            list = list.filter(item => {
+                if (targetUrl) {
+                    const itemUrl = cleanSourceUrl(item.upstream || item.homepage);
+                    if (itemUrl && itemUrl === targetUrl) return false;
+                }
+                if (name && (item.target_repo || item.crate_name || '').toLowerCase() === name) return false;
+                return true;
+            });
+        }
         setCachedRepos(list);
     }
 
@@ -409,7 +501,7 @@
         const textSpan = item.querySelector('.vault-btn-text');
         const target = getCurrentPageTarget();
         if (target && textSpan) {
-            renderButtonState(btn, textSpan, isTargetBacked(target.target_repo));
+            renderButtonState(btn, textSpan, isTargetBacked(target));
         }
     }
 
@@ -1015,8 +1107,8 @@
             return;
         }
 
-        const targetName = target.target_repo;
-        const backed = isTargetBacked(targetName);
+        const backedItem = findBackedItem(target);
+        const backed = Boolean(backedItem);
 
         if (!backed) {
             // ===== 未备份状态：加入备份清单 =====
@@ -1032,20 +1124,23 @@
                         type: target.type,
                         upstream: target.type === 'crate' ? undefined : `https://${location.hostname}/${target.fullName}.git`,
                         crate_name: target.crate_name,
-                        target_repo: targetName,
+                        target_repo: target.target_repo,
                         homepage: window.location.href,
                         private: true
                     }
                 };
-                await callApi('/api/repos', 'POST', payload);
-                addTargetToCache({
-                    target_repo: targetName,
-                    type: target.type,
-                    homepage: window.location.href,
-                    private: true
-                });
+                const res = await callApi('/api/repos', 'POST', payload);
+                if (res.oldRenamed) {
+                    updateRepoInCache(res.oldRenamed.from, res.oldRenamed.to);
+                }
+                const addedItem = res.data || payload.item;
+                addTargetToCache(addedItem);
                 renderButtonState(btn, textSpan, true);
-                showGlobalToast(`✅ 已将 [${targetName}] 添加至备份清单并排入同步`);
+                if (res.degraded) {
+                    showGlobalToast(`✅ 检测到同名仓库，已按规范降级为 [${addedItem.target_repo}]`);
+                } else {
+                    showGlobalToast(`✅ 已将 [${addedItem.target_repo}] 添加至备份清单并排入同步`);
+                }
             } catch (err) {
                 showGlobalToast(`❌ 备份失败: ${err.message}`);
                 renderButtonState(btn, textSpan, false);
@@ -1054,8 +1149,9 @@
                 btn.style.opacity = '1';
             }
         } else {
-            // ===== 已备份状态：确认取消备份 (方案 A 对标 Unstar) =====
-            if (!confirm(`确定要取消备份并从清单中移除 [${targetName}] 吗？\n(注意：不会删除实际备份仓库)`)) {
+            // ===== 已备份状态：确认取消备份 =====
+            const deleteTarget = (backedItem && (backedItem.target_repo || backedItem.crate_name)) || target.target_repo;
+            if (!confirm(`确定要取消备份并从清单中移除 [${deleteTarget}] 吗？\n(注意：不会删除实际备份仓库)`)) {
                 return;
             }
 
@@ -1064,10 +1160,10 @@
             textSpan.innerText = '移除中...';
 
             try {
-                await callApi('/api/repos', 'DELETE', { target_repo: targetName });
-                removeTargetFromCache(targetName);
+                await callApi('/api/repos', 'DELETE', { target_repo: deleteTarget });
+                removeTargetFromCache(backedItem || deleteTarget);
                 renderButtonState(btn, textSpan, false);
-                showGlobalToast(`🗑️ 已从备份清单中移除 [${targetName}]`);
+                showGlobalToast(`🗑️ 已从备份清单中移除 [${deleteTarget}]`);
             } catch (err) {
                 showGlobalToast(`❌ 移除失败: ${err.message}`);
                 renderButtonState(btn, textSpan, true);
@@ -1125,7 +1221,7 @@
         const textSpan = btn.querySelector('.vault-btn-text');
 
         // 初始依据本地缓存直接渲染状态 (零延迟)
-        renderButtonState(btn, textSpan, isTargetBacked(target.target_repo));
+        renderButtonState(btn, textSpan, isTargetBacked(target));
 
         // 左键：智能在备份/取消备份之间切换
         btn.onclick = (e) => {
@@ -1183,7 +1279,7 @@
         const textSpan = wrapper.querySelector('.vault-btn-text');
 
         // 依据本地缓存渲染状态
-        renderButtonState(wrapper, textSpan, isTargetBacked(target.target_repo));
+        renderButtonState(wrapper, textSpan, isTargetBacked(target));
 
         // 左键：智能在备份/取消备份之间切换
         wrapper.onclick = (e) => {

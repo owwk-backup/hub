@@ -100,21 +100,63 @@ export default {
         }
 
         const { list, sha } = await getRemoteConfig(ORG, CONFIG_REPO, ghHeaders);
-        const exists = list.some(x => x.target_repo === itemToAdd.target_repo);
 
-        if (exists) {
-          return new Response(JSON.stringify({ success: true, message: '已存在于清单中，无需重复添加', data: itemToAdd }), { headers: corsHeaders });
+        // 1. 检查是否完全来自同一上游源（已在清单中，无需重复添加）
+        const existingExact = list.find(x => isSameSource(x, itemToAdd));
+        if (existingExact) {
+          return new Response(JSON.stringify({
+            success: true,
+            message: '已存在于清单中，无需重复添加',
+            data: existingExact
+          }), { headers: corsHeaders });
+        }
+
+        // 2. 检查 target_repo 是否存在重名冲突
+        const conflictIndex = list.findIndex(x => (x.target_repo || '').toLowerCase() === itemToAdd.target_repo.toLowerCase());
+
+        let degraded = false;
+        let oldRenamed = null;
+
+        if (conflictIndex !== -1) {
+          degraded = true;
+          const conflictItem = list[conflictIndex];
+
+          // 老仓库透明降级命名: 计算 owner.repo
+          const oldScopedName = getScopedRepoName(conflictItem, list, conflictItem);
+          const oldTargetRepo = conflictItem.target_repo;
+
+          if (oldScopedName !== oldTargetRepo) {
+            // 在 GitHub 远端重命名已有老仓库
+            await renameGitHubRepo(ORG, oldTargetRepo, oldScopedName, ghHeaders);
+            conflictItem.target_repo = oldScopedName;
+            oldRenamed = { from: oldTargetRepo, to: oldScopedName };
+          }
+
+          // 新仓库透明降级命名
+          const newScopedName = getScopedRepoName(itemToAdd, list);
+          itemToAdd.target_repo = newScopedName;
         }
 
         list.push(itemToAdd);
-        await saveRemoteConfig(ORG, CONFIG_REPO, list, sha, `chore: add ${itemToAdd.target_repo} via worker`, ghHeaders);
+
+        const commitMsg = degraded
+          ? `chore: auto-degrade conflict and add ${itemToAdd.target_repo} via worker`
+          : `chore: add ${itemToAdd.target_repo} via worker`;
+
+        await saveRemoteConfig(ORG, CONFIG_REPO, list, sha, commitMsg, ghHeaders);
 
         // 异步触发 Action
         if (body.triggerSync !== false) {
           ctx.waitUntil(triggerDispatch(ORG, HUB_REPO, ghHeaders));
         }
 
-        return new Response(JSON.stringify({ success: true, message: '添加成功并已排入同步队列', data: itemToAdd }), { headers: corsHeaders });
+        return new Response(JSON.stringify({
+          success: true,
+          message: degraded ? `检测到同名仓库冲突，已自动按规范降级为 [${itemToAdd.target_repo}] 隔离存储` : '添加成功并已排入同步队列',
+          data: itemToAdd,
+          degraded,
+          oldRenamed
+        }), { headers: corsHeaders });
       }
 
       // 4. [DELETE] 删除指定备份项目
@@ -267,6 +309,80 @@ async function saveRemoteConfig(org, repo, list, sha, message, headers) {
     body: JSON.stringify({ message, content, sha })
   });
   if (!res.ok) throw new Error(`写回配置仓失败: ${res.statusText}`);
+}
+
+// 帮助函数：在 GitHub 远端重命名仓库
+async function renameGitHubRepo(org, oldName, newName, headers) {
+  console.log(`[Rename] 正在请求将 ${org}/${oldName} 更名为 ${newName}...`);
+  const res = await fetch(`https://api.github.com/repos/${org}/${oldName}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ name: newName })
+  });
+
+  if (res.status === 404) {
+    console.warn(`[Rename 404] 仓库 ${org}/${oldName} 在远端尚不存在，跳过远端改名`);
+    return { success: true, notFound: true };
+  }
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error(`❌ [Rename Failed HTTP ${res.status}]`, errText);
+    throw new Error(`重命名仓库 ${oldName} -> ${newName} 失败 [HTTP ${res.status}]: ${errText}`);
+  }
+
+  console.log(`✅ [Rename Success] 仓库 ${oldName} 已在 GitHub 成功更名为 ${newName}`);
+  return { success: true };
+}
+
+// 比对两个条目是否指向同一上游来源
+function isSameSource(a, b) {
+  if (!a || !b) return false;
+  if (a.type === 'crate' && b.type === 'crate') {
+    return (a.crate_name || a.target_repo) === (b.crate_name || b.target_repo);
+  }
+  const cleanUrl = (url) => {
+    if (!url) return '';
+    try {
+      const u = new URL(url);
+      return `${u.hostname}${u.pathname.replace(/\.git$/, '').replace(/\/$/, '')}`.toLowerCase();
+    } catch {
+      return String(url).replace(/\.git$/, '').replace(/\/$/, '').toLowerCase();
+    }
+  };
+  const urlA = cleanUrl(a.upstream || a.homepage);
+  const urlB = cleanUrl(b.upstream || b.homepage);
+  return Boolean(urlA && urlB && urlA === urlB);
+}
+
+// 计算重名时的规范降级名称: owner.repo
+function getScopedRepoName(item, currentList = [], excludeItem = null) {
+  let baseName = '';
+  if (item.type === 'crate') {
+    baseName = `crates.${item.crate_name || item.target_repo}`;
+  } else {
+    const urlStr = item.upstream || item.homepage || '';
+    try {
+      const u = new URL(urlStr);
+      const parts = u.pathname.replace(/\.git$/, '').split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        const owner = parts[parts.length - 2];
+        const repo = parts[parts.length - 1];
+        baseName = `${owner}.${repo}`;
+      }
+    } catch {}
+    if (!baseName) {
+      baseName = item.target_repo;
+    }
+  }
+
+  let candidate = baseName;
+  let counter = 1;
+  const isTaken = (name) => currentList.some(x => x !== excludeItem && x.target_repo && x.target_repo.toLowerCase() === name.toLowerCase());
+  while (isTaken(candidate)) {
+    candidate = `${baseName}.${counter++}`;
+  }
+  return candidate;
 }
 
 // 帮助函数：触发 Action 并严格检查响应
