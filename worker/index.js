@@ -304,6 +304,17 @@ function parsePageInfo(urlStr) {
           private: true
         };
       }
+    } else if (u.hostname === 'codeberg.org') {
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2 && !['explore', 'user', 'org', 'api', 'help', 'search'].includes(parts[0])) {
+        return {
+          type: 'git',
+          upstream: `https://codeberg.org/${parts[0]}/${parts[1]}.git`,
+          target_repo: parts[1],
+          homepage: `https://codeberg.org/${parts[0]}/${parts[1]}`,
+          private: true
+        };
+      }
     } else if (u.hostname === 'crates.io') {
       const parts = u.pathname.split('/').filter(Boolean);
       if (parts[0] === 'crates' && parts[1]) {

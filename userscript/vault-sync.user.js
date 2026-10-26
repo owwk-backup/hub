@@ -1,13 +1,17 @@
 // ==UserScript==
 // @name         Vault 一键备份助手 (原生 GitHub 风格 + 高级筛选排序面板版)
 // @namespace    https://github.com/owwk-backup
-// @version      2.4.1
+// @version      2.5.1
 // @description  原生 Starred 交互风格状态感知：左键备份/取消备份，右键开启控制台(高级筛选/排序/调度配置)
 // @author       owwk-backup
 // @match        *://github.com/*
 // @match        *://*.github.com/*
 // @include      *://github.com/*
 // @include      *://*.github.com/*
+// @match        *://codeberg.org/*
+// @match        *://*.codeberg.org/*
+// @include      *://codeberg.org/*
+// @include      *://*.codeberg.org/*
 // @match        *://crates.io/*
 // @run-at       document-end
 // @grant        GM_xmlhttpRequest
@@ -254,6 +258,15 @@
                         fullName: `${parts[0]}/${parts[1]}`
                     };
                 }
+            } else if (u.hostname.includes('codeberg.org')) {
+                const parts = u.pathname.split('/').filter(Boolean);
+                if (parts.length >= 2 && !['explore', 'user', 'org', 'api', 'help', 'search'].includes(parts[0])) {
+                    return {
+                        type: 'git',
+                        target_repo: parts[1],
+                        fullName: `${parts[0]}/${parts[1]}`
+                    };
+                }
             } else if (u.hostname.includes('crates.io')) {
                 const parts = u.pathname.split('/').filter(Boolean);
                 if (parts[0] === 'crates' && parts[1]) {
@@ -390,9 +403,10 @@
 
     // 刷新页面上存在的按钮状态
     function refreshButtonStatusIfPresent() {
-        const btn = document.querySelector('#vault-backup-action-item button');
-        if (!btn) return;
-        const textSpan = btn.querySelector('.vault-btn-text');
+        const item = document.getElementById('vault-backup-action-item');
+        if (!item) return;
+        const btn = item.tagName === 'BUTTON' ? item : (item.querySelector('button') || item);
+        const textSpan = item.querySelector('.vault-btn-text');
         const target = getCurrentPageTarget();
         if (target && textSpan) {
             renderButtonState(btn, textSpan, isTargetBacked(target.target_repo));
@@ -1011,7 +1025,19 @@
             textSpan.innerText = '提交中...';
 
             try {
-                await callApi('/api/repos', 'POST', { url: window.location.href });
+                // 优先直接传递解析完的完整 item 对象，兼容未部署最新解析路由的 Worker，且降低服务端解析失败率
+                const payload = {
+                    url: window.location.href,
+                    item: {
+                        type: target.type,
+                        upstream: target.type === 'crate' ? undefined : `https://${location.hostname}/${target.fullName}.git`,
+                        crate_name: target.crate_name,
+                        target_repo: targetName,
+                        homepage: window.location.href,
+                        private: true
+                    }
+                };
+                await callApi('/api/repos', 'POST', payload);
                 addTargetToCache({
                     target_repo: targetName,
                     type: target.type,
@@ -1122,10 +1148,69 @@
         return true;
     }
 
+    // Codeberg (Forgejo / Gitea) 注入函数
+    function injectCodeberg() {
+        const target = getCurrentPageTarget();
+        if (!target) return false;
+
+        const container = document.querySelector('.repo-buttons');
+        if (!container) return false;
+
+        const existingItem = document.getElementById('vault-backup-action-item');
+        if (existingItem && container.contains(existingItem)) {
+            refreshButtonStatusIfPresent();
+            return true;
+        }
+
+        if (existingItem) {
+            try { existingItem.remove(); } catch {}
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.id = 'vault-backup-action-item';
+        wrapper.className = 'ui compact small basic button vault-action-btn';
+        wrapper.style.cursor = 'pointer';
+
+        wrapper.innerHTML = `
+            <span style="display: inline-flex; align-items: center; gap: 4px;">
+                <span class="vault-btn-icon" style="display: inline-flex; align-items: center;">
+                    ${ARCHIVE_ICON}
+                </span>
+                <span class="vault-btn-text" style="font-weight: 600;">备份</span>
+            </span>
+        `;
+
+        const textSpan = wrapper.querySelector('.vault-btn-text');
+
+        // 依据本地缓存渲染状态
+        renderButtonState(wrapper, textSpan, isTargetBacked(target.target_repo));
+
+        // 左键：智能在备份/取消备份之间切换
+        wrapper.onclick = (e) => {
+            e.preventDefault();
+            handleBackupButtonClick(wrapper, textSpan);
+        };
+
+        // 右键：唤出高级控制台
+        wrapper.oncontextmenu = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openDashboardModal();
+        };
+
+        // 挂载到操作栏的最前面
+        container.insertBefore(wrapper, container.firstChild);
+
+        syncReposCacheSilently();
+        return true;
+    }
+
     function checkAndInject() {
         const host = location.hostname;
         if (host.includes('github.com')) {
             return injectGitHub();
+        } else if (host.includes('codeberg.org')) {
+            return injectCodeberg();
         }
         return false;
     }
